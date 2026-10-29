@@ -8,7 +8,9 @@ const settings = require('./settings');
  * Lets phones and computers show a system notification even when eTricks is closed.
  * Browsers only allow this on https:// pages (http://localhost counts as secure).
  */
-const SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@etricks.local';
+// Push services want a mailto: or https:// contact. A bare email address is accepted and fixed up here.
+const rawSubject = (process.env.VAPID_SUBJECT || '').trim();
+const SUBJECT = /^(mailto:|https:\/\/)/i.test(rawSubject) ? rawSubject : rawSubject.includes('@') ? `mailto:${rawSubject}` : 'mailto:admin@etricks.local';
 const { encrypt, validEndpoint, b64u, fromB64u } = require('./pushcrypto');
 
 // ---- VAPID keys (created once, stored in the database settings) ----
