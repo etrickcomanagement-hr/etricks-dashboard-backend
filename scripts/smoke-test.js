@@ -189,6 +189,23 @@ async function main() {
     const cf2 = (await admin('GET', `/api/company-finance/summary?from=${YESTERDAY}&to=${TODAY}`)).data.totals;
     check('salaries flow into company finance', cf2.salariesPaid === 2500 && cf2.netProfit === 900 - 2500, JSON.stringify(cf2));
 
+    console.log('Choosing PINs');
+    const weak = ['123456', '111111', '000000', '654321', '12345', 'abcdef', '1234567'];
+    let weakRefused = true;
+    for (const pw of weak) if ((await leader('POST', '/api/employees', { name: 'Weak PIN', joinDate: '2026-10-01', pin: pw })).status !== 400) weakRefused = false;
+    check('easy or malformed PINs are refused', weakRefused);
+    const chosen = await leader('POST', '/api/employees', { name: 'Chosen Pin', designation: 'Support', joinDate: '2026-10-01', pin: '482913' });
+    check('leader sets a member PIN while adding them', chosen.status === 200 && chosen.data.pin === '482913');
+    const pinMember = client();
+    check('member signs in with the PIN the leader chose', (await pinMember('POST', '/api/auth/login', { portal: 'member', departmentId: ebayId, password: ebay[2], employeeId: chosen.data.id, pin: '482913' })).status === 200);
+    check('reset to another chosen PIN', (await leader('POST', `/api/employees/${chosen.data.id}/reset-pin`, { pin: '739104' })).data.pin === '739104');
+    check('old PIN stops working', (await client()('POST', '/api/auth/login', { portal: 'member', departmentId: ebayId, password: ebay[2], employeeId: chosen.data.id, pin: '482913' })).status === 401);
+    check('new PIN works', (await client()('POST', '/api/auth/login', { portal: 'member', departmentId: ebayId, password: ebay[2], employeeId: chosen.data.id, pin: '739104' })).status === 200);
+    const auto = await leader('POST', `/api/employees/${chosen.data.id}/reset-pin`, {});
+    check('empty PIN still generates one', /^\d{6}$/.test(auto.data.pin));
+    check('weak PIN refused on reset', (await leader('POST', `/api/employees/${chosen.data.id}/reset-pin`, { pin: '222222' })).status === 400);
+    await leader('PUT', `/api/employees/${chosen.data.id}`, { name: 'Chosen Pin', joinDate: '2026-10-01', status: 'inactive' });
+
     console.log('Notifications');
     const leaderNotes = (await leader('GET', '/api/notifications?limit=100')).data;
     check('leader notified when member checks in', leaderNotes.items.some((n) => /checked in/.test(n.title)));

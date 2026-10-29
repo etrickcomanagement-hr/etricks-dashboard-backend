@@ -20,6 +20,15 @@ const BASE_SELECT = `
 
 const shape = (r) => r && { ...r, custom: parseJson(r.custom, {}) };
 
+// A PIN chosen by the leader/admin: exactly 6 digits and not trivially guessable. Empty means "generate one".
+function chosenPin(v) {
+  if (v === undefined || v === null || String(v).trim() === '') return null;
+  const p = String(v).trim();
+  if (!/^\d{6}$/.test(p)) throw bad('PIN must be exactly 6 digits');
+  if (/^(\d)\1{5}$/.test(p) || '01234567890123'.includes(p) || '98765432109876'.includes(p)) throw bad('That PIN is too easy to guess (like 111111 or 123456). Choose another.');
+  return p;
+}
+
 function addHistory(employeeId, type, eventDate, details, by) {
   db.insert('employee_history', { employeeId, eventType: type, eventDate: eventDate || today(), details, recordedBy: by, createdAt: new Date().toISOString() });
 }
@@ -113,7 +122,7 @@ module.exports = {
 
     m.post('/api/employees', { roles: lead }, (ctx) => {
       const e = input(ctx, null);
-      const pin = auth.generatePin();
+      const pin = chosenPin(ctx.body.pin) || auth.generatePin();
       const result = db.tx(() => {
         const next = db.get('SELECT COALESCE(MAX(id),0)+1 AS n FROM employees').n;
         const empCode = `ETX-${String(next).padStart(4, '0')}`;
@@ -122,7 +131,7 @@ module.exports = {
         return { id: r.id, empCode };
       });
       ctx.audit('create', 'employee', result.id, `${e.name} (${result.empCode})`, e.departmentId);
-      return { ...result, pin }; // PIN is shown once; only its hash is stored
+      return { ...result, pin }; // only the hash is stored; the PIN is shown once so it can be handed over
     });
 
     m.put('/api/employees/:id', { roles: lead }, (ctx) => {
@@ -163,7 +172,7 @@ module.exports = {
       const e = db.get('SELECT * FROM employees WHERE id=?', id);
       if (!e) throw new HttpError(404, 'Employee not found');
       ctx.assertDept(e.departmentId);
-      const pin = auth.generatePin();
+      const pin = chosenPin(ctx.body.pin) || auth.generatePin();
       db.update('employees', id, { pinHash: auth.hashSecret(pin) });
       db.run('DELETE FROM sessions WHERE employee_id=?', id);
       ctx.audit('pin_reset', 'employee', id, e.name, e.departmentId);
