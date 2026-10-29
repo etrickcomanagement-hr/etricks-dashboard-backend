@@ -1,0 +1,12 @@
+{
+  "name": "etricks-hub",
+  "version": "1.0.0",
+  "description": "Etricks internal management platform: departments, teams, attendance, leave, tasks, finance and performance.",
+  "private": true,
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --no-warnings server.js",
+    "demo": "node --no-warnings scripts/demo-data.js",
+    "test": "node --no-warnings scripts/smoke-test.js"
+  }
+}
