@@ -53,7 +53,6 @@ The script installs Node.js, this backend, a service that restarts it, HTTPS (Ca
 ```
 npm start        # http://127.0.0.1:3000 (API only, there is no website in this repo)
 npm test         # end-to-end check of the whole API on a throw-away database
-npm run demo     # sample people, attendance, orders, salaries (empty database only)
 ```
 
 ## Add a feature (payroll, CRM, recruitment...)

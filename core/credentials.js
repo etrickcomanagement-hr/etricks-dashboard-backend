@@ -8,7 +8,7 @@ const file = path.join(config.dataDir, 'initial-credentials.txt');
 
 function append(line) {
   if (!fs.existsSync(file)) {
-    fs.writeFileSync(file, 'eTricks - initial credentials (change them from the Admin portal, then delete this file)\r\n' + '='.repeat(60) + '\r\n');
+    fs.writeFileSync(file, 'eTricks - initial credentials (change them from the Admin portal, then delete this file)\r\n' + '='.repeat(60) + '\r\n', { mode: 0o600 });
   }
   fs.appendFileSync(file, line + '\r\n');
 }

@@ -58,9 +58,13 @@ const throttle = {
     }
   },
   fail(key) {
-    const a = attempts.get(key) || { n: 0, until: 0 };
-    if (++a.n >= 6) { a.until = Date.now() + 10 * 60e3; a.n = 0; }
+    const now = Date.now();
+    let a = attempts.get(key);
+    // Old failures expire: 6 typos spread over weeks must not lock anyone out.
+    if (!a || (a.until <= now && now - a.first > 15 * 60e3)) a = { n: 0, first: now, until: 0 };
+    if (++a.n >= 6) { a.until = now + 10 * 60e3; a.n = 0; a.first = now; }
     attempts.set(key, a);
+    if (attempts.size > 5000) for (const [k, v] of attempts) if (v.until <= now && now - v.first > 15 * 60e3) attempts.delete(k);
   },
   ok(key) { attempts.delete(key); },
 };

@@ -6,7 +6,6 @@
   "engines": { "node": ">=22.13" },
   "scripts": {
     "start": "node --no-warnings server.js",
-    "demo": "node --no-warnings scripts/demo-data.js",
     "test": "node --no-warnings scripts/smoke-test.js"
   }
 }

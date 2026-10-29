@@ -21,7 +21,7 @@ fi
 
 # --- packages ---
 apt-get update -y
-apt-get install -y curl git ca-certificates ufw caddy
+apt-get install -y curl git ca-certificates ufw caddy fail2ban
 # Node.js 24 (same as the tests); fall back to the 22 LTS line if 24 is unavailable
 (curl -fsSL https://deb.nodesource.com/setup_24.x | bash -) || (curl -fsSL https://deb.nodesource.com/setup_22.x | bash -)
 apt-get install -y nodejs
@@ -107,6 +107,7 @@ EOF
 chmod +x /usr/local/bin/etricks-update
 
 # --- start everything ---
+systemctl enable --now fail2ban
 systemctl daemon-reload
 systemctl enable --now etricks
 systemctl restart caddy
