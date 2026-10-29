@@ -15,7 +15,9 @@ function startSession(ctx, info) {
   ctx.user = { role: info.role, label: info.label, departmentId: info.departmentId ?? null, employeeId: info.employeeId ?? null };
 }
 
-const publicUser = (u) => u && { role: u.role, label: u.label, departmentId: u.departmentId, employeeId: u.employeeId };
+// A team leader's own name (set by the admin) is looked up fresh, so a change shows without signing in again.
+const leaderName = (u) => (u.role === 'leader' ? db.get('SELECT leader_name FROM departments WHERE id=?', u.departmentId)?.leaderName || null : null);
+const publicUser = (u) => u && { role: u.role, label: u.label, departmentId: u.departmentId, employeeId: u.employeeId, name: leaderName(u) };
 
 function activeDepartment(id) {
   const dept = db.get('SELECT * FROM departments WHERE id=? AND active=1', id);

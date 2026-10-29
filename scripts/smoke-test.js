@@ -206,6 +206,15 @@ async function main() {
     check('weak PIN refused on reset', (await leader('POST', `/api/employees/${chosen.data.id}/reset-pin`, { pin: '222222' })).status === 400);
     await leader('PUT', `/api/employees/${chosen.data.id}`, { name: 'Chosen Pin', joinDate: '2026-10-01', status: 'inactive' });
 
+    console.log('Team leader name');
+    check('leader cannot rename the department or set the leader name', (await leader('PUT', `/api/departments/${ebayId}`, { name: 'eBay Department', leaderName: 'Hacker' })).status === 403);
+    check('admin adds the team leader name', (await admin('PUT', `/api/departments/${ebayId}`, { name: 'eBay Department', color: '#4F8DF7', leaderName: 'Bilal Sheikh' })).status === 200);
+    check('leader portal now knows its name', (await leader('GET', '/api/auth/me')).data.user.name === 'Bilal Sheikh');
+    check('departments list shows the leader name', (await admin('GET', '/api/departments')).data.find((d) => d.id === ebayId).leaderName === 'Bilal Sheikh');
+    check('leader salary page uses that name', (await admin('GET', `/api/salaries?type=leader&period=${PERIOD}`)).data.rows.find((r) => r.refId === ebayId).name === 'Bilal Sheikh');
+    check('renaming without leaderName keeps the name', (await admin('PUT', `/api/departments/${ebayId}`, { name: 'eBay Department', color: '#4F8DF7' })).status === 200 && (await admin('GET', '/api/departments')).data.find((d) => d.id === ebayId).leaderName === 'Bilal Sheikh');
+    check('members add by the leader keep working', (await leader('GET', '/api/employees')).status === 200);
+
     console.log('Notifications');
     const leaderNotes = (await leader('GET', '/api/notifications?limit=100')).data;
     check('leader notified when member checks in', leaderNotes.items.some((n) => /checked in/.test(n.title)));

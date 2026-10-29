@@ -45,6 +45,8 @@ module.exports = {
        id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
        break_minutes INTEGER NOT NULL DEFAULT 60, grace_minutes INTEGER NOT NULL DEFAULT 10,
        active INTEGER NOT NULL DEFAULT 1);`,
+    // 2: the admin records who the department's team leader is
+    'ALTER TABLE departments ADD COLUMN leader_name TEXT;',
   ],
 
   seed() {
@@ -71,7 +73,7 @@ module.exports = {
     // ---- departments ----
     m.get('/api/departments', { roles: any }, (ctx) => {
       const rows = db.all(
-        `SELECT d.id, d.name, d.slug, d.color, d.description, d.active,
+        `SELECT d.id, d.name, d.slug, d.color, d.description, d.active, d.leader_name,
                 (SELECT COUNT(*) FROM employees e WHERE e.department_id=d.id AND e.status='active') AS employee_count,
                 (SELECT COUNT(*) FROM teams t WHERE t.department_id=d.id) AS team_count
            FROM departments d ${ctx.user.role === 'admin' ? '' : 'WHERE d.id=' + Number(ctx.user.departmentId)}
@@ -85,6 +87,7 @@ module.exports = {
       const slug = str(b.slug || name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''), 'Slug', { required: true, max: 40 });
       const r = db.insert('departments', {
         name, slug, color: str(b.color, 'Color', { max: 20 }) || '#A8FF5A', description: str(b.description, 'Description', { max: 300 }),
+        leaderName: str(b.leaderName, 'Team leader name', { max: 80 }),
         leaderHash: auth.hashSecret(validatePassword(b.leaderPassword, 'Leader password')),
         memberHash: auth.hashSecret(validatePassword(b.memberPassword, 'Member password')),
         sort: 100, createdAt: new Date().toISOString(),
@@ -95,9 +98,11 @@ module.exports = {
 
     m.put('/api/departments/:id', { roles: ['admin'] }, (ctx) => {
       const id = int(ctx.params.id, 'Department', { required: true });
-      if (!db.get('SELECT 1 AS x FROM departments WHERE id=?', id)) throw new HttpError(404, 'Department not found');
+      const current = db.get('SELECT leader_name FROM departments WHERE id=?', id);
+      if (!current) throw new HttpError(404, 'Department not found');
       const b = ctx.body;
       db.update('departments', id, {
+        leaderName: b.leaderName !== undefined ? str(b.leaderName, 'Team leader name', { max: 80 }) : current.leaderName,
         name: str(b.name, 'Name', { required: true, max: 80 }),
         color: str(b.color, 'Color', { max: 20 }) || '#A8FF5A',
         description: str(b.description, 'Description', { max: 300 }),

@@ -22,10 +22,10 @@ function payeeInfo(type, refId) {
     const e = db.get('SELECT e.id, e.name, e.emp_code, e.department_id, e.designation, d.name AS department_name FROM employees e JOIN departments d ON d.id=e.department_id WHERE e.id=?', refId);
     return e && { type, refId: e.id, name: e.name, code: e.empCode, departmentId: e.departmentId, departmentName: e.departmentName, designation: e.designation };
   }
-  const d = db.get('SELECT id, name FROM departments WHERE id=?', refId);
+  const d = db.get('SELECT id, name, leader_name FROM departments WHERE id=?', refId);
   if (!d) return null;
   const rate = db.get("SELECT payee_name FROM salary_rates WHERE payee_type='leader' AND ref_id=?", refId);
-  return { type, refId: d.id, name: rate?.payeeName || `${d.name} team leader`, code: null, departmentId: d.id, departmentName: d.name, designation: 'Team leader' };
+  return { type, refId: d.id, name: d.leaderName || rate?.payeeName || `${d.name} team leader`, code: null, departmentId: d.id, departmentName: d.name, designation: 'Team leader' };
 }
 
 // Leaders manage their own department's members; only the admin manages leaders.
@@ -158,6 +158,7 @@ module.exports = {
         `INSERT INTO salary_rates(payee_type, ref_id, amount, payee_name, updated_at) VALUES (?,?,?,?,?)
          ON CONFLICT(payee_type, ref_id) DO UPDATE SET amount=excluded.amount, payee_name=COALESCE(excluded.payee_name, salary_rates.payee_name), updated_at=excluded.updated_at`,
         type, payee.refId, amount, name, new Date().toISOString());
+      if (type === 'leader' && name) db.update('departments', payee.refId, { leaderName: name }); // one name for the leader everywhere
       ctx.audit('salary_set', 'salary', payee.refId, `${payee.name}: monthly salary ${amount}`, payee.departmentId);
       return { ok: true };
     });
