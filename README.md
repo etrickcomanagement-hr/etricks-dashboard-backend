@@ -31,6 +31,16 @@ The server of the eTricks Hub: sign-in, departments, employees, attendance, leav
 
 `render.yaml` in this repo does the same with one click: **New + → Blueprint**.
 
+## Deploy on a DigitalOcean Droplet (or any Ubuntu VPS)
+
+The cheapest option with a real disk: a Basic Droplet (Ubuntu 24.04, 1 GB RAM) is enough.
+
+1. Open `digitalocean-setup.sh`, copy its whole content and change the two lines marked `EDIT` (your Admin password and your email).
+2. Create the Droplet. Under **Advanced Options** tick **Add Initialization scripts** and paste the script there.
+3. After 3 to 5 minutes the server is ready. Its address is `https://<server-ip-with-dashes>.sslip.io` (for example IP 203.0.113.7 gives `https://203-0-113-7.sslip.io`). Check `.../api/health`, then put that address into `vercel.json` of the website repo.
+
+The script installs Node.js, this backend, a service that restarts it, HTTPS (Caddy) and a firewall. The database is in `/var/lib/etricks`. To update later, log in to the server and run `etricks-update`.
+
 ## Good to know
 
 - The first start creates the departments (eBay, TikTok Shop, Etsy, Walmart, Shopify, Amazon) and the admin password. If `ADMIN_PASSWORD` is not set, a random one is printed once in the deploy log.
