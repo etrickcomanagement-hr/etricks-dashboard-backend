@@ -4,13 +4,15 @@ const path = require('node:path');
 const root = path.resolve(__dirname, '..');
 // On Railway, attach a Volume: its mount path is picked up automatically so the database survives redeploys.
 const onRailway = !!(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID);
+const onRender = !!process.env.RENDER; // Render sets RENDER=true; attach a Disk and set DATA_DIR to its mount path
 const dataDir = path.resolve(process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(root, 'data'));
 
 module.exports = {
   root,
   port: Number(process.env.PORT) || 3000,
-  host: process.env.HOST || (onRailway ? '0.0.0.0' : '127.0.0.1'),
+  host: process.env.HOST || (onRailway || onRender ? '0.0.0.0' : '127.0.0.1'),
   onRailway,
+  onRender,
   hasPersistentStorage: !!(process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH),
   dataDir,
   dbFile: path.join(dataDir, 'etricks.db'),

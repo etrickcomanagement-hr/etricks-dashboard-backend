@@ -8,9 +8,9 @@ const http = require('./core/http');
 const backup = require('./core/backup');
 const auth = require('./core/auth');
 
-if (config.onRailway && !config.hasPersistentStorage) {
-  console.warn('\n!!! WARNING: no Volume is attached. The database lives on temporary disk and WILL BE ERASED on every redeploy.');
-  console.warn('!!! In Railway: add a Volume to this service (mount path /data), then redeploy.\n');
+if ((config.onRailway || config.onRender) && !config.hasPersistentStorage) {
+  console.warn('\n!!! WARNING: no persistent storage. The database lives on temporary disk and WILL BE ERASED on every restart or redeploy.');
+  console.warn('!!! Railway: add a Volume (mount path /data). Render: add a Disk (mount path /data) and set DATA_DIR=/data. Then redeploy.\n');
 }
 
 const loaded = modules.loadAll();

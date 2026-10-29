@@ -1,0 +1,32 @@
+# Render Blueprint: New + -> Blueprint -> choose this repo. Render asks for the two secret values below.
+# The Starter plan is a paid plan; it is needed because the database lives on a persistent Disk
+# (free web services have no disk, so their data would be erased on every restart).
+services:
+  - type: web
+    name: etricks-backend
+    runtime: node
+    region: singapore
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    disk:
+      name: etricks-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: VAPID_SUBJECT
+        sync: false
+      - key: DATA_DIR
+        value: /data
+      - key: SECURE_COOKIES
+        value: "1"
+      - key: TRUST_PROXY
+        value: "1"
+      - key: TZ
+        value: Asia/Karachi
+      - key: NODE_VERSION
+        value: "24"

@@ -20,6 +20,17 @@ The server of the eTricks Hub: sign-in, departments, employees, attendance, leav
 5. Put that address into `vercel.json` of the website repo (`etricks-dashboard`).
 6. Open the Vercel website, sign in to the **Admin portal** with `ADMIN_PASSWORD`, then go to **Departments → Passwords** and set the Team Leader and Team Member password of each department. (The six departments are created on first start with random passwords that nobody has seen.)
 
+## Deploy on Render instead
+
+1. Sign in to render.com with GitHub. **New + → Web Service** → pick this repo.
+2. Language **Node**, Build Command `npm install`, Start Command `npm start`, Health Check Path `/api/health`, region closest to you (for example Singapore).
+3. Instance type **Starter** (paid). A **Disk** is needed for the database and the free plan has none, so on the free plan **all data is erased on every restart** (and the service sleeps after 15 minutes without visitors).
+4. Under Advanced add a **Disk**: mount path `/data`, size 1 GB.
+5. Environment variables: `ADMIN_PASSWORD`, `DATA_DIR=/data`, `SECURE_COOKIES=1`, `TRUST_PROXY=1`, `TZ=Asia/Karachi`, `VAPID_SUBJECT=mailto:you@yourcompany.com`, `NODE_VERSION=24`.
+6. Create the service; when it is Live open `https://<name>.onrender.com/api/health` (answers `{"ok":true}`), then put that address into `vercel.json` of the website repo.
+
+`render.yaml` in this repo does the same with one click: **New + → Blueprint**.
+
 ## Good to know
 
 - The first start creates the departments (eBay, TikTok Shop, Etsy, Walmart, Shopify, Amazon) and the admin password. If `ADMIN_PASSWORD` is not set, a random one is printed once in the deploy log.
@@ -41,4 +52,4 @@ Create `modules/<name>/index.js` with its tables (`migrations`) and API (`routes
 
 ## Environment variables
 
-`PORT` (set by Railway), `HOST` (0.0.0.0 on Railway), `DATA_DIR` (defaults to the Volume), `TZ`, `SESSION_HOURS` (12), `BACKUP_KEEP` (30), `SECURE_COOKIES`, `TRUST_PROXY`, `ADMIN_PASSWORD`, `VAPID_SUBJECT`, `PUSH_EXTRA_HOSTS`.
+`PORT` (set by the host), `HOST` (0.0.0.0 on Railway and Render), `DATA_DIR` (defaults to the Railway Volume; set it to the Disk path on Render), `TZ`, `SESSION_HOURS` (12), `BACKUP_KEEP` (30), `SECURE_COOKIES`, `TRUST_PROXY`, `ADMIN_PASSWORD`, `VAPID_SUBJECT`, `PUSH_EXTRA_HOSTS`.
