@@ -69,7 +69,16 @@ module.exports = {
   },
 
   routes(m) {
-    m.get('/api/auth/me', (ctx) => ({ user: publicUser(ctx.user) }));
+    // One call tells the website who is signed in and, for a signed-in person, the settings and modules (saves round trips).
+    m.get('/api/auth/me', (ctx) => {
+      const out = { user: publicUser(ctx.user), companyName: settings.get('companyName') };
+      if (ctx.user) {
+        const s = settings.all();
+        out.settings = { companyName: s.companyName, currency: s.currency, weeklyOff: s.weeklyOff, leaveTypes: s.leaveTypes, expenseCategories: s.expenseCategories, scoreWeights: s.scoreWeights };
+        out.modules = require('../../core/modules').describe();
+      }
+      return out;
+    });
 
     m.get('/api/public/departments', () =>
       db.all('SELECT id, name, slug, color FROM departments WHERE active=1 ORDER BY sort, name'));
