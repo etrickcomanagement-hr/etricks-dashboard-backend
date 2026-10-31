@@ -87,6 +87,7 @@ async function main() {
     const tC = (await hod('POST', '/api/teams', { name: 'Gamma' })).data.id;
     const tZ = (await hod2('POST', '/api/teams', { name: 'Zeta' })).data.id;
     check('four teams created', [tA, tB, tC, tZ].every(Number.isInteger));
+    check('a department cannot have more than 3 teams (3 team leaders)', (await hod('POST', '/api/teams', { name: 'Delta' })).status === 400 && (await admin('POST', '/api/teams', { departmentId: ebayId, name: 'Delta' })).status === 400 && (await hod('GET', '/api/teams')).data.length === 3);
     check('duplicate team name refused', (await hod('POST', '/api/teams', { name: 'Alpha' })).status === 400);
     check('head sees only their own department teams', (await hod('GET', '/api/teams')).data.length === 3 && (await hod2('GET', '/api/teams')).data.length === 1);
     check('leader needs a password', (await hod('POST', `/api/teams/${tA}/leader`, { name: 'No Pass' })).status === 400);

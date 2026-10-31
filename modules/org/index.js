@@ -27,6 +27,9 @@ const TEAM_SELECT = `
          (SELECT COUNT(*) FROM employees e WHERE e.team_id=t.id AND e.role='member' AND e.status='active') AS member_count
     FROM teams t JOIN departments d ON d.id=t.department_id LEFT JOIN employees l ON l.id=t.leader_employee_id`;
 
+// One head and three team leaders per department; every team has exactly one leader, so three teams at most.
+const MAX_TEAMS_PER_DEPARTMENT = 3;
+
 const randomHash = () => auth.hashSecret(auth.generatePassword(24)); // departments no longer have their own sign-in passwords
 
 function loadTeam(id) {
@@ -159,6 +162,9 @@ module.exports = {
       if (!departmentId) throw bad('Department is required');
       if (!db.get('SELECT 1 AS x FROM departments WHERE id=?', departmentId)) throw bad('Department not found');
       const name = str(ctx.body.name, 'Team name', { required: true, max: 80 });
+      if (db.get('SELECT COUNT(*) AS n FROM teams WHERE department_id=?', departmentId).n >= MAX_TEAMS_PER_DEPARTMENT) {
+        throw bad(`A department can have only ${MAX_TEAMS_PER_DEPARTMENT} teams, each with one team leader`);
+      }
       try {
         const r = db.insert('teams', { departmentId, name, createdAt: new Date().toISOString() });
         ctx.audit('create', 'team', r.id, name, departmentId);
