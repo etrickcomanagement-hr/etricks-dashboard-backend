@@ -32,6 +32,13 @@ const CORE_MIGRATIONS = [
      id INTEGER PRIMARY KEY, recipient_role TEXT NOT NULL, recipient_id INTEGER NOT NULL DEFAULT 0,
      endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL, user_agent TEXT, created_at TEXT NOT NULL);
    CREATE INDEX idx_push_rcpt ON push_subscriptions(recipient_role, recipient_id);`,
+  // 4: every member, team leader and head of department is a person with their own notifications ('employee').
+  //    Old department-wide leader notifications and everybody's sessions are dropped: people sign in again.
+  `UPDATE notifications SET recipient_role='employee' WHERE recipient_role='member';
+   DELETE FROM notifications WHERE recipient_role='leader';
+   UPDATE push_subscriptions SET recipient_role='employee' WHERE recipient_role='member';
+   DELETE FROM push_subscriptions WHERE recipient_role='leader';
+   DELETE FROM sessions;`,
 ];
 
 const loaded = [];

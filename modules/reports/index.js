@@ -1,9 +1,13 @@
 'use strict';
 const db = require('../../core/db');
 const settings = require('../../core/settings');
+const scope = require('../../core/scope');
 const { HttpError, range, today, addDays, monthStart, eachDay, parseYmd, oneOf, round, int } = require('../../core/util');
 
 const PRESENT = ['present', 'late', 'half_day'];
+const ALL_ROLES = ',member,team_leader,hod,';
+// Team and department figures are the members' work; team leaders and heads appear as people in the employee list.
+const membersOnly = (csv) => (String(csv || ALL_ROLES).includes(',member,') ? ',member,' : ',,');
 
 // Weighted score over whichever components exist (a new joiner with no tasks is not punished for it).
 function score(attRate, taskRate, avgRating) {
@@ -15,12 +19,12 @@ function score(attRate, taskRate, avgRating) {
 
 // Raw per-employee counters for a date range. Everything else (rates, scores) derives from these,
 // so team and department reports can simply add the counters up.
-function employeeMetrics(from, to, { departmentId = null, teamId = null, employeeId = null } = {}) {
+function employeeMetrics(from, to, { departmentId = null, teamId = null, employeeId = null, rolesCsv = ALL_ROLES } = {}) {
   const emps = db.all(
-    `SELECT e.id, e.emp_code, e.name, e.join_date, e.department_id, e.team_id, d.name AS department_name, t.name AS team_name
+    `SELECT e.id, e.emp_code, e.name, e.role, e.join_date, e.department_id, e.team_id, d.name AS department_name, t.name AS team_name
        FROM employees e JOIN departments d ON d.id=e.department_id LEFT JOIN teams t ON t.id=e.team_id
-      WHERE e.status='active' AND e.join_date<=? AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR e.team_id=?) AND (? IS NULL OR e.id=?)
-      ORDER BY d.sort, t.name, e.name`, to, departmentId, departmentId, teamId, teamId, employeeId, employeeId);
+      WHERE instr(?, ',' || e.role || ',') > 0 AND e.status='active' AND e.join_date<=? AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR e.team_id=?) AND (? IS NULL OR e.id=?)
+      ORDER BY d.sort, CASE e.role WHEN 'hod' THEN 0 WHEN 'team_leader' THEN 1 ELSE 2 END, t.name, e.name`, rolesCsv, to, departmentId, departmentId, teamId, teamId, employeeId, employeeId);
   if (!emps.length) return [];
 
   const off = settings.get('weeklyOff');
@@ -75,7 +79,7 @@ function employeeMetrics(from, to, { departmentId = null, teamId = null, employe
     const done = ts.filter((t) => t.status === 'done');
     const lg = logBy[e.id];
     return {
-      employeeId: e.id, empCode: e.empCode, name: e.name, departmentId: e.departmentId, departmentName: e.departmentName,
+      employeeId: e.id, empCode: e.empCode, name: e.name, role: e.role, departmentId: e.departmentId, departmentName: e.departmentName,
       teamId: e.teamId, teamName: e.teamName,
       workingDays: days.length, presentDays: present, leaveDays, lateCount: late, workedMinutes: workedMin, workedDays,
       tasksTotal: ts.length, tasksDone: done.length,
@@ -113,11 +117,12 @@ function aggregate(rows, keyFn, labelFn) {
   return [...groups.values()].map((g) => finish({ ...g, hoursLogged: round(g.hoursLogged) }));
 }
 
-function performance(level, from, to, scope) {
-  const emps = employeeMetrics(from, to, scope);
+function performance(level, from, to, filter) {
+  const emps = employeeMetrics(from, to, level === 'employee' ? filter : { ...filter, rolesCsv: membersOnly(filter.rolesCsv) });
   if (level === 'employee') return emps.map(finish).sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
   if (level === 'team') {
-    return aggregate(emps, (r) => r.teamId ?? `d${r.departmentId}`, (r) => ({ teamId: r.teamId, teamName: r.teamName || '(No team)', departmentId: r.departmentId, departmentName: r.departmentName }))
+    const leaders = Object.fromEntries(db.all('SELECT t.id, l.name FROM teams t LEFT JOIN employees l ON l.id=t.leader_employee_id').map((t) => [t.id, t.name]));
+    return aggregate(emps, (r) => r.teamId ?? `d${r.departmentId}`, (r) => ({ teamId: r.teamId, teamName: r.teamName || '(No team)', leaderName: leaders[r.teamId] || null, departmentId: r.departmentId, departmentName: r.departmentName }))
       .sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
   }
   const fin = Object.fromEntries(db.all(
@@ -133,9 +138,9 @@ function performance(level, from, to, scope) {
 
 const COLUMNS = {
   employee: [
-    { label: 'Code', key: 'empCode' }, { label: 'Employee', key: 'name' }, { label: 'Department', key: 'departmentName' }, { label: 'Team', key: 'teamName' },
+    { label: 'Code', key: 'empCode' }, { label: 'Employee', key: 'name' }, { label: 'Role', key: 'role' }, { label: 'Department', key: 'departmentName' }, { label: 'Team', key: 'teamName' },
   ],
-  team: [{ label: 'Team', key: 'teamName' }, { label: 'Department', key: 'departmentName' }, { label: 'Employees', key: 'employees' }],
+  team: [{ label: 'Team', key: 'teamName' }, { label: 'Team leader', key: 'leaderName' }, { label: 'Department', key: 'departmentName' }, { label: 'Employees', key: 'employees' }],
   department: [{ label: 'Department', key: 'departmentName' }, { label: 'Employees', key: 'employees' }],
 };
 const METRIC_COLUMNS = [
@@ -172,11 +177,11 @@ function memberRows(from, to, scope) {
 // Everything about one person for a period: the printable "member report".
 function employeeReport(employeeId, from, to) {
   const emp = db.get(
-    `SELECT e.id, e.emp_code, e.name, e.designation, e.role, e.status, e.join_date, e.phone, e.department_id, d.name AS department_name,
+    `SELECT e.id, e.emp_code, e.name, e.designation, e.role, e.status, e.join_date, e.phone, e.department_id, e.team_id, d.name AS department_name,
             t.name AS team_name, s.name AS shift_name
        FROM employees e JOIN departments d ON d.id=e.department_id LEFT JOIN teams t ON t.id=e.team_id LEFT JOIN shifts s ON s.id=e.shift_id WHERE e.id=?`, employeeId);
   if (!emp) throw new HttpError(404, 'Employee not found');
-  const row = memberRows(from, to, { employeeId })[0] || null;
+  const row = memberRows(from, to, { employeeId, rolesCsv: ALL_ROLES })[0] || null;
   const orderRows = db.all('SELECT * FROM member_orders WHERE employee_id=? AND date BETWEEN ? AND ? ORDER BY date DESC, id DESC LIMIT 200', employeeId, from, to);
   const o = orderRows.reduce((s, r) => ({ orders: s.orders + r.orders, investment: s.investment + r.investment, revenue: s.revenue + r.revenue }), { orders: 0, investment: 0, revenue: 0 });
   return {
@@ -193,42 +198,50 @@ function employeeReport(employeeId, from, to) {
   };
 }
 
-function todayStats(departmentId) {
+// One row per person in scope with what they did today.
+function todayRows({ dept = null, team = null, rolesCsv = ALL_ROLES, canApprove = () => true } = {}) {
   const day = today();
-  const emps = db.all("SELECT id, department_id FROM employees WHERE status='active' AND join_date<=? AND (? IS NULL OR department_id=?)", day, departmentId, departmentId);
-  const recs = db.all(
-    `SELECT a.employee_id, a.status, a.approval, e.department_id FROM attendance a JOIN employees e ON e.id=a.employee_id
-      WHERE a.date=? AND (? IS NULL OR e.department_id=?)`, day, departmentId, departmentId);
-  const recBy = Object.fromEntries(recs.map((r) => [r.employeeId, r]));
+  const emps = db.all(
+    `SELECT e.id, e.role, e.department_id, e.team_id FROM employees e
+      WHERE instr(?, ',' || e.role || ',') > 0 AND e.status='active' AND e.join_date<=? AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR e.team_id=?)`,
+    rolesCsv, day, dept, dept, team, team);
+  const recBy = Object.fromEntries(db.all('SELECT employee_id, status, approval FROM attendance WHERE date=?', day).map((r) => [r.employeeId, r]));
   const onLeave = new Set(db.all("SELECT employee_id FROM leave_requests WHERE status='approved' AND from_date<=? AND to_date>=?", day, day).map((l) => l.employeeId));
-  const out = {};
-  for (const e of emps) {
-    const o = (out[e.departmentId] ||= { employees: 0, present: 0, late: 0, onLeave: 0, notMarked: 0, pendingAttendance: 0 });
+  return emps.map((e) => {
     const r = recBy[e.id];
-    o.employees++;
-    if (r && PRESENT.includes(r.status)) { o.present++; if (r.status === 'late') o.late++; }
-    else if (r?.status === 'leave' || (!r && onLeave.has(e.id))) o.onLeave++;
-    else if (!r) o.notMarked++;
-    if (r?.approval === 'pending') o.pendingAttendance++;
-  }
-  return out;
+    let state = 'not_marked';
+    if (r && PRESENT.includes(r.status)) state = r.status === 'late' ? 'late' : 'present';
+    else if (r?.status === 'leave' || (!r && onLeave.has(e.id))) state = 'leave';
+    else if (r) state = 'other';
+    return { id: e.id, role: e.role, departmentId: e.departmentId, teamId: e.teamId, state, pending: r?.approval === 'pending' && canApprove(e) };
+  });
 }
+
+const summarise = (rows) => ({
+  employees: rows.length,
+  present: rows.filter((r) => r.state === 'present' || r.state === 'late').length,
+  late: rows.filter((r) => r.state === 'late').length,
+  onLeave: rows.filter((r) => r.state === 'leave').length,
+  notMarked: rows.filter((r) => r.state === 'not_marked').length,
+  pendingAttendance: rows.filter((r) => r.pending).length,
+});
 
 module.exports = {
   id: 'reports',
   name: 'Dashboard & Performance Reports',
-  description: 'Admin / leader dashboards and employee, team and department performance.',
+  description: 'Admin, head and team leader dashboards and employee, team and department performance.',
   order: 70,
 
   routes(m) {
-    const lead = ['admin', 'leader'];
+    const lead = ['admin', 'hod', 'leader'];
+    const self = ['hod', 'leader', 'member'];
 
     m.get('/api/reports/performance', { roles: lead }, (ctx) => {
       const q = ctx.query;
       const level = oneOf(q.level, 'Level', ['employee', 'team', 'department'], { def: 'employee' });
       const { from, to } = range(q);
       const dept = ctx.scopeDept(q.departmentId);
-      const rows = performance(level, from, to, { departmentId: dept, teamId: q.teamId || null });
+      const rows = performance(level, from, to, { departmentId: dept, teamId: ctx.scopeTeam(q.teamId), rolesCsv: ctx.rolesCsv() });
       if (q.format === 'csv') {
         const cols = [...COLUMNS[level], ...METRIC_COLUMNS, ...(level === 'department' ? FINANCE_COLUMNS : [])];
         return ctx.csv(`performance-${level}-${from}-to-${to}.csv`, cols, rows);
@@ -240,10 +253,10 @@ module.exports = {
     m.get('/api/reports/members', { roles: lead }, (ctx) => {
       const q = ctx.query;
       const { from, to } = range(q);
-      const rows = memberRows(from, to, { departmentId: ctx.scopeDept(q.departmentId), teamId: q.teamId || null });
+      const rows = memberRows(from, to, { departmentId: ctx.scopeDept(q.departmentId), teamId: ctx.scopeTeam(q.teamId), rolesCsv: ctx.rolesCsv() });
       if (q.format === 'csv') {
         return ctx.csv(`member-report-${from}-to-${to}.csv`, [
-          { label: 'Code', key: 'empCode' }, { label: 'Employee', key: 'name' }, { label: 'Department', key: 'departmentName' }, { label: 'Team', key: 'teamName' },
+          { label: 'Code', key: 'empCode' }, { label: 'Employee', key: 'name' }, { label: 'Role', key: 'role' }, { label: 'Department', key: 'departmentName' }, { label: 'Team', key: 'teamName' },
           { label: 'Attendance %', key: 'attendanceRate' }, { label: 'Present days', key: 'presentDays' }, { label: 'Absent days', key: 'absentDays' }, { label: 'Late', key: 'lateCount' },
           { label: 'Orders taken', key: 'ordersTaken' }, { label: 'Investment', key: 'investment' }, { label: 'Sales', key: 'sales' }, { label: 'Profit', key: 'profit' },
           { label: 'Tasks done', key: 'tasksDone' }, { label: 'Tasks total', key: 'tasksTotal' }, { label: 'Complaints (period)', key: 'complaints' },
@@ -256,77 +269,110 @@ module.exports = {
     m.get('/api/reports/employee/:id', { roles: lead }, (ctx) => {
       const id = int(ctx.params.id, 'Employee', { required: true });
       const { from, to } = range(ctx.query);
-      const rep = employeeReport(id, from, to);
-      ctx.assertDept(rep.employee.departmentId);
-      return rep;
+      const who = scope.loadEmployee(id);
+      if (!who) throw new HttpError(404, 'Employee not found');
+      ctx.assertSee(who);
+      return employeeReport(id, from, to);
     });
 
-    m.get('/api/reports/me', { roles: ['member'] }, (ctx) => {
+    m.get('/api/reports/me', { roles: self }, (ctx) => {
       const { from, to } = range(ctx.query);
       return employeeReport(ctx.user.employeeId, from, to);
     });
 
     m.get('/api/dashboard', { roles: lead }, (ctx) => {
       const dept = ctx.scopeDept(ctx.query.departmentId);
+      const team = ctx.scopeTeam(ctx.query.teamId);
+      const rolesCsv = ctx.rolesCsv();
       const day = today();
       const mFrom = monthStart();
-      const stats = todayStats(dept);
-      const sum = (key) => Object.values(stats).reduce((s, o) => s + o[key], 0);
+      const rows = todayRows({ dept, team, rolesCsv, canApprove: (e) => ctx.canApprovePunch({ id: e.id, role: e.role, departmentId: e.departmentId, teamId: e.teamId }) });
+      const stats = summarise(rows);
 
       const trend = eachDay(addDays(day, -13), day).map((d) => ({
         date: d,
         present: db.get(
           `SELECT COUNT(*) AS n FROM attendance a JOIN employees e ON e.id=a.employee_id
-            WHERE a.date=? AND a.status IN ('present','late','half_day') AND a.approval<>'rejected' AND (? IS NULL OR e.department_id=?)`, d, dept, dept).n,
+            WHERE instr(?, ',' || e.role || ',') > 0 AND a.date=? AND a.status IN ('present','late','half_day') AND a.approval<>'rejected'
+              AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR e.team_id=?)`, rolesCsv, d, dept, dept, team, team).n,
       }));
 
       const taskRows = db.all(
-        `SELECT status, due_date FROM tasks WHERE (? IS NULL OR department_id=?)`, dept, dept);
-      const fin = db.all('SELECT * FROM finance_entries WHERE date>=? AND (? IS NULL OR department_id=?)', mFrom, dept, dept);
+        `SELECT k.status, k.due_date, e.department_id, e.team_id FROM tasks k JOIN employees e ON e.id=k.assigned_to
+          WHERE instr(?, ',' || e.role || ',') > 0 AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR e.team_id=?)`, rolesCsv, dept, dept, team, team);
+      const fin = db.all('SELECT * FROM finance_entries WHERE date>=? AND (? IS NULL OR department_id=?) AND (? IS NULL OR team_id=?)', mFrom, dept, dept, team, team);
       const tot = { orders: 0, investment: 0, revenue: 0, expenses: 0 };
       for (const f of fin) for (const k of Object.keys(tot)) tot[k] += f[k];
 
-      const perf = performance('employee', mFrom, day, { departmentId: dept });
+      const perf = performance('employee', mFrom, day, { departmentId: dept, teamId: team, rolesCsv });
+      const pendingLeave = (deptId, teamId) => db.get(
+        `SELECT COUNT(*) AS n FROM leave_requests l JOIN employees e ON e.id=l.employee_id
+          WHERE l.status='pending' AND instr(?, ',' || e.role || ',') > 0 AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR e.team_id=?)`, rolesCsv, deptId, deptId, teamId, teamId).n;
+
       const departments = ctx.user.role === 'admin' && !dept
         ? db.all('SELECT id, name, color FROM departments WHERE active=1 ORDER BY sort, name').map((d) => {
             const f = fin.filter((x) => x.departmentId === d.id);
             const t = f.reduce((a, x) => ({ orders: a.orders + x.orders, investment: a.investment + x.investment, revenue: a.revenue + x.revenue, expenses: a.expenses + x.expenses }), { orders: 0, investment: 0, revenue: 0, expenses: 0 });
             return {
-              ...d, ...(stats[d.id] || { employees: 0, present: 0, late: 0, onLeave: 0, notMarked: 0, pendingAttendance: 0 }),
-              pendingLeave: db.get("SELECT COUNT(*) AS n FROM leave_requests l JOIN employees e ON e.id=l.employee_id WHERE l.status='pending' AND e.department_id=?", d.id).n,
-              openTasks: db.get("SELECT COUNT(*) AS n FROM tasks WHERE department_id=? AND status<>'done'", d.id).n,
+              ...d, ...summarise(rows.filter((r) => r.departmentId === d.id)),
+              head: db.get("SELECT name FROM employees WHERE department_id=? AND role='hod' AND status='active' ORDER BY id LIMIT 1", d.id)?.name || null,
+              teamCount: db.get('SELECT COUNT(*) AS n FROM teams WHERE department_id=?', d.id).n,
+              pendingLeave: pendingLeave(d.id, null),
+              openTasks: taskRows.filter((k) => k.departmentId === d.id && k.status !== 'done').length,
               orders: t.orders, revenue: round(t.revenue), investment: round(t.investment), profit: round(t.revenue - t.investment - t.expenses),
             };
           })
         : null;
 
+      // The head (and the admin, once a department is chosen) sees every team of the department side by side.
+      let teams = null;
+      if (dept && ctx.user.role !== 'leader') {
+        const teamPerf = Object.fromEntries(performance('team', mFrom, day, { departmentId: dept, rolesCsv }).map((t) => [t.teamId, t]));
+        const sales = Object.fromEntries(db.all(
+          `SELECT e.team_id, COALESCE(SUM(o.orders),0) AS orders, COALESCE(SUM(o.revenue),0) AS revenue, COALESCE(SUM(o.investment),0) AS investment
+             FROM member_orders o JOIN employees e ON e.id=o.employee_id WHERE o.date>=? AND e.department_id=? GROUP BY e.team_id`, mFrom, dept).map((o) => [o.teamId, o]));
+        teams = db.all('SELECT t.id, t.name, l.name AS leader_name FROM teams t LEFT JOIN employees l ON l.id=t.leader_employee_id WHERE t.department_id=? ORDER BY t.name', dept).map((t) => {
+          const mine = rows.filter((r) => r.teamId === t.id && r.role === 'member');
+          const sl = sales[t.id] || { orders: 0, revenue: 0, investment: 0 };
+          return {
+            id: t.id, name: t.name, leaderName: t.leaderName, ...summarise(mine),
+            pendingLeave: pendingLeave(dept, t.id),
+            openTasks: taskRows.filter((k) => k.teamId === t.id && k.status !== 'done').length,
+            orders: sl.orders, sales: round(sl.revenue), profit: round(sl.revenue - sl.investment),
+            attendanceRate: teamPerf[t.id]?.attendanceRate ?? null, score: teamPerf[t.id]?.score ?? null,
+          };
+        });
+      }
+
       return {
-        date: day, scope: dept,
-        today: { employees: sum('employees'), present: sum('present'), late: sum('late'), onLeave: sum('onLeave'), notMarked: sum('notMarked') },
-        pending: {
-          attendance: sum('pendingAttendance'),
-          leave: db.get("SELECT COUNT(*) AS n FROM leave_requests l JOIN employees e ON e.id=l.employee_id WHERE l.status='pending' AND (? IS NULL OR e.department_id=?)", dept, dept).n,
-        },
+        date: day, scope: dept, team,
+        today: { employees: stats.employees, present: stats.present, late: stats.late, onLeave: stats.onLeave, notMarked: stats.notMarked },
+        pending: { attendance: stats.pendingAttendance, leave: pendingLeave(dept, team) },
         tasks: {
           open: taskRows.filter((t) => t.status !== 'done').length,
           overdue: taskRows.filter((t) => t.status !== 'done' && t.dueDate && t.dueDate < day).length,
           done: taskRows.filter((t) => t.status === 'done').length,
         },
         finance: { from: mFrom, to: day, orders: tot.orders, investment: round(tot.investment), revenue: round(tot.revenue), profit: round(tot.revenue - tot.investment - tot.expenses) },
-        trend, departments,
+        trend, departments, teams,
         topPerformers: perf.filter((p) => p.score != null).slice(0, 5),
         lowAttendance: perf.filter((p) => p.attendanceRate != null && p.workingDays >= 3).sort((a, b) => a.attendanceRate - b.attendanceRate).slice(0, 5),
       };
     });
 
-    m.get('/api/dashboard/me', { roles: ['member'] }, (ctx) => {
+    m.get('/api/dashboard/me', { roles: self }, (ctx) => {
       const day = today();
       const [me] = performance('employee', monthStart(), day, { employeeId: ctx.user.employeeId });
       const pendingLeave = db.get("SELECT COUNT(*) AS n FROM leave_requests WHERE employee_id=? AND status='pending'", ctx.user.employeeId).n;
+      // Rank among the people of the same kind: members within their team, team leaders and heads within the department.
       const rank = (() => {
-        const all = performance('employee', monthStart(), day, { departmentId: ctx.user.departmentId });
+        const mineRole = me?.role === 'team_leader' ? ',team_leader,' : me?.role === 'hod' ? ',hod,' : ',member,';
+        const peers = me?.role === 'member' && me.teamId
+          ? { teamId: me.teamId, rolesCsv: mineRole }
+          : { departmentId: ctx.user.departmentId, rolesCsv: mineRole };
+        const all = performance('employee', monthStart(), day, peers);
         const idx = all.findIndex((r) => r.employeeId === ctx.user.employeeId);
-        return idx >= 0 && all[idx].score != null ? { position: idx + 1, of: all.length } : null;
+        return idx >= 0 && all[idx].score != null && all.length > 1 ? { position: idx + 1, of: all.length } : null;
       })();
       return { month: me || null, pendingLeave, rank };
     });

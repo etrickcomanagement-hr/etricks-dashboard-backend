@@ -15,8 +15,8 @@ module.exports = {
   order: 90,
 
   routes(m) {
-    const any = ['admin', 'leader', 'member'];
-    const lead = ['admin', 'leader'];
+    const any = ['admin', 'hod', 'leader', 'member'];
+    const lead = ['admin', 'hod']; // the activity log is for the admin and (for their department) the head
 
     m.get('/api/health', () => ({ ok: true }));
 
@@ -124,7 +124,7 @@ module.exports = {
     });
 
     m.post('/api/push/test', { roles: any }, (ctx) => {
-      const to = ctx.user.role === 'member' ? { role: 'member', employeeId: ctx.user.employeeId } : ctx.user.role === 'leader' ? { role: 'leader', departmentId: ctx.user.departmentId } : { role: 'admin' };
+      const to = ctx.user.role === 'admin' ? { role: 'admin' } : { employeeId: ctx.user.employeeId };
       notify.send(to, { title: 'Test notification', body: 'Notifications are working on this device.', link: '#/dashboard', kind: 'test' });
       return { ok: true };
     });

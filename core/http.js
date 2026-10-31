@@ -5,6 +5,7 @@ const path = require('node:path');
 const config = require('./config');
 const auth = require('./auth');
 const audit = require('./audit');
+const scope = require('./scope');
 const { HttpError, toCsv } = require('./util');
 
 const PUBLIC_DIR = path.join(config.root, 'public');
@@ -86,6 +87,7 @@ function buildCtx(req, url, params, user, body) {
     assertDept(deptId) {
       if (user.role !== 'admin' && Number(deptId) !== user.departmentId) throw new HttpError(403, 'Not allowed for this department');
     },
+    ...(user ? scope.build(user) : {}), // scopeTeam, canSee, canManage, canApprovePunch, assertSee, assertManage ...
     audit(action, entity, entityId, details, departmentId) {
       audit.log(ctx, action, entity, entityId, details, departmentId ?? user?.departmentId ?? null);
     },

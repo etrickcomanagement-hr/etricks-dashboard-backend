@@ -4,7 +4,7 @@ const { HttpError, int, str, num, date, range, today, addDays, bad, round } = re
 
 /*
  * Orders reported by each team member (orders received, money invested, sales made).
- * Team leaders see their department, the admin sees everyone. These figures are the members' own
+ * A team leader sees their team, the head of department all teams of the department, the admin everyone. These figures are the members' own
  * daily reports; they are NOT added to the department Finance page automatically (avoids double counting).
  */
 const SELECT = `
@@ -37,7 +37,7 @@ module.exports = {
   ],
 
   routes(m) {
-    const lead = ['admin', 'leader'];
+    const lead = ['admin', 'hod', 'leader'];
 
     const input = (b) => {
       const day = date(b.date, 'Date', { required: true });
@@ -91,13 +91,14 @@ module.exports = {
     m.get('/api/orders', { roles: lead }, (ctx) => {
       const q = ctx.query;
       const dept = ctx.scopeDept(q.departmentId);
+      const team = ctx.scopeTeam(q.teamId);
       const { from, to } = range(q);
       const search = q.search ? `%${q.search}%` : null;
       const rows = db.all(
-        `${SELECT} WHERE o.date BETWEEN ? AND ? AND (? IS NULL OR o.department_id=?) AND (? IS NULL OR o.employee_id=?)
+        `${SELECT} WHERE instr(?, ',' || e.role || ',') > 0 AND o.date BETWEEN ? AND ? AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR o.employee_id=?)
             AND (? IS NULL OR e.team_id=?) AND (? IS NULL OR e.name LIKE ? OR e.emp_code LIKE ? OR o.store LIKE ?)
           ORDER BY o.date DESC, e.name LIMIT 3000`,
-        from, to, dept, dept, q.employeeId || null, q.employeeId || null, q.teamId || null, q.teamId || null, search, search, search, search);
+        ctx.rolesCsv(), from, to, dept, dept, q.employeeId || null, q.employeeId || null, team, team, search, search, search, search);
       if (q.format === 'csv') {
         return ctx.csv('member-orders.csv', [
           { label: 'Date', key: 'date' }, { label: 'Code', key: 'empCode' }, { label: 'Employee', key: 'employeeName' }, { label: 'Department', key: 'departmentName' },
@@ -109,7 +110,10 @@ module.exports = {
       for (const r of rows) (by[r.employeeId] ||= { employeeId: r.employeeId, name: r.employeeName, empCode: r.empCode, departmentName: r.departmentName, rows: [] }).rows.push(r);
       const byEmployee = Object.values(by).map((g) => ({ employeeId: g.employeeId, name: g.name, empCode: g.empCode, departmentName: g.departmentName, ...totals(g.rows) }))
         .sort((a, b) => b.revenue - a.revenue);
-      return { rows, totals: totals(rows), byEmployee };
+      const teams = {};
+      for (const r of rows) (teams[r.teamId ?? 0] ||= { teamId: r.teamId, name: r.teamName || 'No team', rows: [] }).rows.push(r);
+      const byTeam = Object.values(teams).map((g) => ({ teamId: g.teamId, name: g.name, ...totals(g.rows) })).sort((a, b) => b.revenue - a.revenue);
+      return { rows, totals: totals(rows), byEmployee, byTeam };
     });
   },
 };

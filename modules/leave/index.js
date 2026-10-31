@@ -5,7 +5,7 @@ const settings = require('../../core/settings');
 const { HttpError, int, str, oneOf, date, range, today, addDays, eachDay, parseYmd, bad } = require('../../core/util');
 
 const SELECT = `
-  SELECT l.*, e.name AS employee_name, e.emp_code, e.department_id, e.team_id, d.name AS department_name, t.name AS team_name
+  SELECT l.*, e.name AS employee_name, e.emp_code, e.role, e.department_id, e.team_id, d.name AS department_name, t.name AS team_name
     FROM leave_requests l
     JOIN employees e ON e.id=l.employee_id
     JOIN departments d ON d.id=e.department_id
@@ -16,10 +16,12 @@ const workingDays = (from, to) => {
   return eachDay(from, to).filter((d) => !off.includes(parseYmd(d).getDay())).length;
 };
 
+const personOf = (l) => ({ id: l.employeeId, role: l.role, departmentId: l.departmentId, teamId: l.teamId });
+
 module.exports = {
   id: 'leave',
   name: 'Leave Management',
-  description: 'Leave requests from employees and approval by team leaders.',
+  description: 'Leave requests from members, team leaders and heads, decided by the person above them.',
   order: 40,
 
   migrations: [
@@ -32,14 +34,15 @@ module.exports = {
   ],
 
   routes(m) {
-    const lead = ['admin', 'leader'];
+    const lead = ['admin', 'hod', 'leader'];
+    const self = ['hod', 'leader', 'member'];
 
-    m.get('/api/leave/types', { roles: ['admin', 'leader', 'member'] }, () => settings.get('leaveTypes'));
+    m.get('/api/leave/types', { roles: ['admin', 'hod', 'leader', 'member'] }, () => settings.get('leaveTypes'));
 
-    m.get('/api/leave/me', { roles: ['member'] }, (ctx) =>
+    m.get('/api/leave/me', { roles: self }, (ctx) =>
       db.all(`${SELECT} WHERE l.employee_id=? ORDER BY l.from_date DESC`, ctx.user.employeeId));
 
-    m.post('/api/leave', { roles: ['member'] }, (ctx) => {
+    m.post('/api/leave', { roles: self }, (ctx) => {
       const b = ctx.body;
       const from = date(b.fromDate, 'From date', { required: true });
       const to = date(b.toDate, 'To date', { required: true });
@@ -55,12 +58,12 @@ module.exports = {
         fromDate: from, toDate: to, days, reason: str(b.reason, 'Reason', { required: true, max: 500 }), createdAt: new Date().toISOString(),
       });
       ctx.audit('leave_requested', 'leave', r.id, `${from} to ${to} (${days} day/s)`);
-      const me = db.get('SELECT name, department_id FROM employees WHERE id=?', ctx.user.employeeId);
-      notify.leaderOf(me.departmentId, { title: `${me.name} requested leave`, body: `${from === to ? from : `${from} to ${to}`} · ${days} working day(s) · ${b.leaveType}`, link: '#/leave', kind: 'leave' });
+      const me = db.get('SELECT name FROM employees WHERE id=?', ctx.user.employeeId);
+      notify.toSuperiors(ctx.user.employeeId, { title: `${me.name} requested leave`, body: `${from === to ? from : `${from} to ${to}`} · ${days} working day(s) · ${b.leaveType}`, link: '#/leave', kind: 'leave' });
       return { id: r.id, days };
     });
 
-    m.post('/api/leave/:id/cancel', { roles: ['member'] }, (ctx) => {
+    m.post('/api/leave/:id/cancel', { roles: self }, (ctx) => {
       const id = int(ctx.params.id, 'Request', { required: true });
       const l = db.get('SELECT * FROM leave_requests WHERE id=? AND employee_id=?', id, ctx.user.employeeId);
       if (!l) throw new HttpError(404, 'Request not found');
@@ -73,17 +76,20 @@ module.exports = {
     m.get('/api/leave', { roles: lead }, (ctx) => {
       const q = ctx.query;
       const dept = ctx.scopeDept(q.departmentId);
+      const team = ctx.scopeTeam(q.teamId);
       const { from, to } = range(q, { defFrom: '2000-01-01', defTo: '2999-12-31' });
       const rows = db.all(
         `${SELECT}
-          WHERE (? IS NULL OR e.department_id=?) AND (? IS NULL OR l.status=?) AND (? IS NULL OR l.employee_id=?)
+          WHERE instr(?, ',' || e.role || ',') > 0 AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR e.team_id=?)
+            AND (? IS NULL OR l.status=?) AND (? IS NULL OR l.employee_id=?) AND (? IS NULL OR e.role=?)
             AND l.to_date>=? AND l.from_date<=? AND (? IS NULL OR e.name LIKE ? OR e.emp_code LIKE ?)
           ORDER BY (l.status='pending') DESC, l.from_date DESC LIMIT 2000`,
-        dept, dept, q.status || null, q.status || null, q.employeeId || null, q.employeeId || null, from, to,
-        q.search ? `%${q.search}%` : null, `%${q.search}%`, `%${q.search}%`);
+        ctx.rolesCsv(), dept, dept, team, team, q.status || null, q.status || null, q.employeeId || null, q.employeeId || null,
+        q.role || null, q.role || null, from, to,
+        q.search ? `%${q.search}%` : null, `%${q.search}%`, `%${q.search}%`).map((l) => ({ ...l, canDecide: ctx.canManage(personOf(l)) }));
       if (q.format === 'csv') {
         return ctx.csv('leave-requests.csv', [
-          { label: 'Code', key: 'empCode' }, { label: 'Employee', key: 'employeeName' }, { label: 'Department', key: 'departmentName' },
+          { label: 'Code', key: 'empCode' }, { label: 'Employee', key: 'employeeName' }, { label: 'Role', key: 'role' }, { label: 'Department', key: 'departmentName' },
           { label: 'Type', key: 'leaveType' }, { label: 'From', key: 'fromDate' }, { label: 'To', key: 'toDate' }, { label: 'Days', key: 'days' },
           { label: 'Reason', key: 'reason' }, { label: 'Status', key: 'status' }, { label: 'Decided by', key: 'decidedBy' }, { label: 'Note', key: 'decisionNote' },
         ], rows);
@@ -91,16 +97,18 @@ module.exports = {
       return rows;
     });
 
+    // A member's leave is decided by their leader (or head / admin), a leader's by the head (or admin), a head's by the admin.
     m.post('/api/leave/:id/decision', { roles: lead }, (ctx) => {
       const id = int(ctx.params.id, 'Request', { required: true });
       const l = db.get(`${SELECT} WHERE l.id=?`, id);
       if (!l) throw new HttpError(404, 'Request not found');
-      ctx.assertDept(l.departmentId);
+      ctx.assertSee(personOf(l));
+      if (!ctx.canManage(personOf(l))) throw new HttpError(403, 'You cannot decide on this leave request');
       if (l.status === 'cancelled') throw bad('This request was cancelled by the employee');
       const status = oneOf(ctx.body.status, 'Decision', ['approved', 'rejected'], { required: true });
       db.update('leave_requests', id, { status, decidedBy: ctx.user.label, decidedAt: new Date().toISOString(), decisionNote: str(ctx.body.note, 'Note', { max: 300 }) });
       ctx.audit(`leave_${status}`, 'leave', id, `${l.employeeName}: ${l.fromDate} to ${l.toDate}`, l.departmentId);
-      notify.send({ role: 'member', employeeId: l.employeeId }, { title: `Your leave was ${status}`, body: `${l.fromDate === l.toDate ? l.fromDate : `${l.fromDate} to ${l.toDate}`}${ctx.body.note ? ` · ${ctx.body.note}` : ''}`, link: '#/my-leave', kind: 'leave' });
+      notify.send({ employeeId: l.employeeId }, { title: `Your leave was ${status}`, body: `${l.fromDate === l.toDate ? l.fromDate : `${l.fromDate} to ${l.toDate}`}${ctx.body.note ? ` · ${ctx.body.note}` : ''}`, link: '#/my-leave', kind: 'leave' });
       return { ok: true };
     });
   },

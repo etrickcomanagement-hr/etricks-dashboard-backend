@@ -6,7 +6,7 @@ const { HttpError, int, str, oneOf, date, time, range, today, addDays, minutesBe
 const STATUSES = ['present', 'late', 'half_day', 'absent', 'leave'];
 
 const SELECT = `
-  SELECT a.*, e.name AS employee_name, e.emp_code, e.department_id, e.team_id,
+  SELECT a.*, e.name AS employee_name, e.emp_code, e.role, e.department_id, e.team_id,
          d.name AS department_name, t.name AS team_name, s.break_minutes AS allowed_break
     FROM attendance a
     JOIN employees e ON e.id=a.employee_id
@@ -64,9 +64,18 @@ function myToday(employeeId) {
 function loadForDecision(ctx, id) {
   const rec = db.get(`${SELECT} WHERE a.id=?`, id);
   if (!rec) throw new HttpError(404, 'Attendance record not found');
-  ctx.assertDept(rec.departmentId);
+  const person = { id: rec.employeeId, role: rec.role, departmentId: rec.departmentId, teamId: rec.teamId };
+  ctx.assertSee(person);
+  if (!ctx.canApprovePunch(person)) {
+    throw new HttpError(403, rec.role === 'member' ? 'You cannot decide on this attendance' : 'Attendance of team leaders and heads is checked by the admin');
+  }
   return rec;
 }
+
+// Marks which rows the caller may approve (the screen shows the buttons only for those).
+const withApproval = (ctx, rows) => rows.map((r) => ({
+  ...r, canApprove: ctx.canApprovePunch({ id: r.employeeId, role: r.role, departmentId: r.departmentId, teamId: r.teamId }),
+}));
 
 module.exports = {
   id: 'attendance',
@@ -87,12 +96,13 @@ module.exports = {
   ],
 
   routes(m) {
-    const lead = ['admin', 'leader'];
+    const lead = ['admin', 'hod', 'leader'];
+    const self = ['hod', 'leader', 'member'];
 
     // ---- member self-service ----
-    m.get('/api/attendance/me/today', { roles: ['member'] }, (ctx) => myToday(ctx.user.employeeId));
+    m.get('/api/attendance/me/today', { roles: self }, (ctx) => myToday(ctx.user.employeeId));
 
-    m.post('/api/attendance/me/action', { roles: ['member'] }, (ctx) => {
+    m.post('/api/attendance/me/action', { roles: self }, (ctx) => {
       const empId = ctx.user.employeeId;
       const action = oneOf(ctx.body.action, 'Action', ['check_in', 'break_start', 'break_end', 'check_out'], { required: true });
       const nowIso = new Date().toISOString();
@@ -121,17 +131,19 @@ module.exports = {
       ctx.audit(action, 'attendance', null, null);
       const result = myToday(empId);
       if ((action === 'check_in' || action === 'check_out') && result.record) {
-        const emp = db.get('SELECT name, department_id FROM employees WHERE id=?', empId);
+        const emp = db.get('SELECT name, role FROM employees WHERE id=?', empId);
         const hm = (iso) => new Date(iso).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
         const r = result.record;
-        notify.leaderOf(emp.departmentId, action === 'check_in'
+        // Members tell their team leader (or the head), leaders their head; leaders and heads are checked by the admin too.
+        notify.toSuperiors(empId, action === 'check_in'
           ? { title: `${emp.name} checked in`, body: `At ${hm(r.checkIn)}${r.status === 'late' ? ' (late)' : ''}`, link: '#/attendance', kind: 'attendance' }
-          : { title: `${emp.name} checked out`, body: `At ${hm(r.checkOut)}${r.workedMinutes != null ? ` · worked ${Math.floor(r.workedMinutes / 60)}h ${r.workedMinutes % 60}m` : ''}${r.overBreak ? ' · break over the allowed time' : ''}`, link: '#/attendance', kind: 'attendance' });
+          : { title: `${emp.name} checked out`, body: `At ${hm(r.checkOut)}${r.workedMinutes != null ? ` · worked ${Math.floor(r.workedMinutes / 60)}h ${r.workedMinutes % 60}m` : ''}${r.overBreak ? ' · break over the allowed time' : ''}`, link: '#/attendance', kind: 'attendance' },
+          { alsoAdmin: emp.role !== 'member' });
       }
       return result;
     });
 
-    m.get('/api/attendance/me', { roles: ['member'] }, (ctx) => {
+    m.get('/api/attendance/me', { roles: self }, (ctx) => {
       const { from, to } = range(ctx.query);
       return decorate(db.all(`${SELECT} WHERE a.employee_id=? AND a.date BETWEEN ? AND ? ORDER BY a.date DESC`, ctx.user.employeeId, from, to));
     });
@@ -141,19 +153,21 @@ module.exports = {
       const q = ctx.query;
       const { from, to } = range(q, { defFrom: today() });
       const dept = ctx.scopeDept(q.departmentId);
-      const rows = decorate(db.all(
+      const team = ctx.scopeTeam(q.teamId);
+      const rows = withApproval(ctx, decorate(db.all(
         `${SELECT}
-          WHERE a.date BETWEEN ? AND ? AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR e.team_id=?)
+          WHERE instr(?, ',' || e.role || ',') > 0 AND a.date BETWEEN ? AND ? AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR e.team_id=?)
+            AND (? IS NULL OR e.role=?)
             AND (? IS NULL OR a.employee_id=?) AND (? IS NULL OR a.status=?) AND (? IS NULL OR a.approval=?)
             AND (? IS NULL OR e.name LIKE ? OR e.emp_code LIKE ?)
           ORDER BY a.date DESC, e.name LIMIT 3000`,
-        from, to, dept, dept, q.teamId || null, q.teamId || null, q.employeeId || null, q.employeeId || null,
+        ctx.rolesCsv(), from, to, dept, dept, team, team, q.role || null, q.role || null, q.employeeId || null, q.employeeId || null,
         q.status || null, q.status || null, q.approval || null, q.approval || null,
-        q.search ? `%${q.search}%` : null, `%${q.search}%`, `%${q.search}%`));
+        q.search ? `%${q.search}%` : null, `%${q.search}%`, `%${q.search}%`)));
       if (q.format === 'csv') {
         const tm = (iso) => (iso ? new Date(iso).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : '');
         return ctx.csv('attendance.csv', [
-          { label: 'Date', key: 'date' }, { label: 'Code', key: 'empCode' }, { label: 'Employee', key: 'employeeName' },
+          { label: 'Date', key: 'date' }, { label: 'Code', key: 'empCode' }, { label: 'Employee', key: 'employeeName' }, { label: 'Role', key: 'role' },
           { label: 'Department', key: 'departmentName' }, { label: 'Team', key: 'teamName' }, { label: 'Status', key: 'status' },
           { label: 'Check in', value: (r) => tm(r.checkIn) }, { label: 'Check out', value: (r) => tm(r.checkOut) },
           { label: 'Break (min)', key: 'breakMinutes' }, { label: 'Worked (min)', key: 'workedMinutes' },
@@ -167,14 +181,20 @@ module.exports = {
     m.get('/api/attendance/board', { roles: lead }, (ctx) => {
       const day = date(ctx.query.date, 'Date') || today();
       const dept = ctx.scopeDept(ctx.query.departmentId);
+      const team = ctx.scopeTeam(ctx.query.teamId);
       const emps = db.all(
-        `SELECT e.id, e.emp_code, e.name, e.department_id, e.team_id, d.name AS department_name, t.name AS team_name, s.name AS shift_name
+        `SELECT e.id, e.emp_code, e.name, e.role, e.department_id, e.team_id, d.name AS department_name, t.name AS team_name, s.name AS shift_name
            FROM employees e JOIN departments d ON d.id=e.department_id LEFT JOIN teams t ON t.id=e.team_id LEFT JOIN shifts s ON s.id=e.shift_id
-          WHERE e.status='active' AND e.join_date<=? AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR e.team_id=?)
-          ORDER BY d.sort, t.name, e.name`, day, dept, dept, ctx.query.teamId || null, ctx.query.teamId || null);
+          WHERE instr(?, ',' || e.role || ',') > 0 AND e.status='active' AND e.join_date<=? AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR e.team_id=?)
+            AND (? IS NULL OR e.role=?)
+          ORDER BY d.sort, CASE e.role WHEN 'hod' THEN 0 WHEN 'team_leader' THEN 1 ELSE 2 END, t.name, e.name`,
+        ctx.rolesCsv(), day, dept, dept, team, team, ctx.query.role || null, ctx.query.role || null);
       const recs = Object.fromEntries(decorate(db.all(`${SELECT} WHERE a.date=?`, day)).map((r) => [r.employeeId, r]));
       const leaves = new Set(db.all("SELECT employee_id FROM leave_requests WHERE status='approved' AND from_date<=? AND to_date>=?", day, day).map((l) => l.employeeId));
-      const rows = emps.map((e) => ({ ...e, record: recs[e.id] || null, onLeave: leaves.has(e.id) }));
+      const rows = emps.map((e) => ({
+        ...e, record: recs[e.id] || null, onLeave: leaves.has(e.id),
+        canApprove: ctx.canApprovePunch({ id: e.id, role: e.role, departmentId: e.departmentId, teamId: e.teamId }),
+      }));
       const count = (fn) => rows.filter(fn).length;
       return {
         date: day, rows,
@@ -194,7 +214,7 @@ module.exports = {
       const approval = oneOf(ctx.body.approval, 'Decision', ['approved', 'rejected'], { required: true });
       db.update('attendance', rec.id, { approval, decidedBy: ctx.user.label, decidedAt: new Date().toISOString(), note: str(ctx.body.note, 'Note', { max: 300 }) ?? rec.note });
       ctx.audit(`attendance_${approval}`, 'attendance', rec.id, `${rec.employeeName} ${rec.date}`, rec.departmentId);
-      notify.send({ role: 'member', employeeId: rec.employeeId }, { title: `Attendance ${approval}`, body: `Your attendance for ${rec.date} was ${approval}`, link: '#/my-attendance', kind: 'attendance' });
+      notify.send({ employeeId: rec.employeeId }, { title: `Attendance ${approval}`, body: `Your attendance for ${rec.date} was ${approval}`, link: '#/my-attendance', kind: 'attendance' });
       return { ok: true };
     });
 
@@ -203,16 +223,18 @@ module.exports = {
       const ids = Array.isArray(ctx.body.ids) ? ctx.body.ids.map(Number).filter(Number.isInteger).slice(0, 500) : [];
       if (!ids.length) throw bad('Select at least one record');
       let n = 0;
+      let skipped = 0;
       db.tx(() => {
         for (const id of ids) {
-          const rec = loadForDecision(ctx, id);
+          let rec;
+          try { rec = loadForDecision(ctx, id); } catch (e) { if (e instanceof HttpError) { skipped++; continue; } throw e; }
           db.update('attendance', id, { approval, decidedBy: ctx.user.label, decidedAt: new Date().toISOString() });
-          notify.send({ role: 'member', employeeId: rec.employeeId }, { title: `Attendance ${approval}`, body: `Your attendance for ${rec.date} was ${approval}`, link: '#/my-attendance', kind: 'attendance' });
+          notify.send({ employeeId: rec.employeeId }, { title: `Attendance ${approval}`, body: `Your attendance for ${rec.date} was ${approval}`, link: '#/my-attendance', kind: 'attendance' });
           n++;
         }
       });
       ctx.audit(`attendance_bulk_${approval}`, 'attendance', null, `${n} record(s)`);
-      return { updated: n };
+      return { updated: n, skipped };
     });
 
     // Leader/admin adds or corrects a day (absent, leave, forgotten check-out ...). Counts as approved.
@@ -221,7 +243,8 @@ module.exports = {
       const empId = int(b.employeeId, 'Employee', { required: true });
       const emp = db.get('SELECT * FROM employees WHERE id=?', empId);
       if (!emp) throw new HttpError(404, 'Employee not found');
-      ctx.assertDept(emp.departmentId);
+      ctx.assertSee(emp);
+      if (!ctx.canApprovePunch(emp)) throw new HttpError(403, emp.role === 'member' ? 'You cannot change this attendance' : 'Attendance of team leaders and heads is changed by the admin');
       const day = date(b.date, 'Date', { required: true });
       if (day > today()) throw bad('Cannot mark attendance for a future date');
       const status = oneOf(b.status, 'Status', STATUSES, { required: true });

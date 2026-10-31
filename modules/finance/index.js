@@ -4,9 +4,9 @@ const cf = require('../../core/customfields');
 const { HttpError, int, str, num, date, range, today, bad, parseJson, round } = require('../../core/util');
 
 const SELECT = `
-  SELECT f.*, d.name AS department_name,
+  SELECT f.*, d.name AS department_name, t.name AS team_name,
          (f.revenue - f.investment - f.expenses) AS profit
-    FROM finance_entries f JOIN departments d ON d.id=f.department_id`;
+    FROM finance_entries f JOIN departments d ON d.id=f.department_id LEFT JOIN teams t ON t.id=f.team_id`;
 
 const shape = (r) => ({ ...r, custom: parseJson(r.custom, {}) });
 
@@ -38,10 +38,29 @@ module.exports = {
        expenses REAL NOT NULL DEFAULT 0, note TEXT, custom TEXT DEFAULT '{}', created_by TEXT,
        created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
      CREATE INDEX idx_fin_dept ON finance_entries(department_id, date);`,
+    // 2: an entry can belong to one team (a team leader's own books); without a team it is a department-wide entry
+    'ALTER TABLE finance_entries ADD COLUMN team_id INTEGER; CREATE INDEX idx_fin_team ON finance_entries(team_id, date);',
   ],
 
   routes(m) {
-    const lead = ['admin', 'leader'];
+    const lead = ['admin', 'hod', 'leader'];
+
+    // A leader works in the books of their own team only; the head and the admin can choose a team or leave it department-wide.
+    const teamFor = (ctx, departmentId, requested) => {
+      if (ctx.user.role === 'leader') {
+        const mine = ctx.myTeamId();
+        if (!(mine > 0)) throw bad('You do not lead a team yet');
+        return mine;
+      }
+      const id = int(requested, 'Team');
+      if (id && !db.get('SELECT 1 AS x FROM teams WHERE id=? AND department_id=?', id, departmentId)) throw bad('Team does not belong to this department');
+      return id;
+    };
+    // Whether the caller may see / change this entry.
+    const mayUse = (ctx, row) => {
+      ctx.assertDept(row.departmentId);
+      if (ctx.user.role === 'leader' && row.teamId !== ctx.myTeamId()) throw new HttpError(403, 'This entry belongs to another team');
+    };
 
     const input = (ctx, existing) => {
       const b = ctx.body;
@@ -51,7 +70,7 @@ module.exports = {
       const day = date(b.date, 'Date', { required: true });
       if (day > today()) throw bad('Date cannot be in the future');
       return {
-        departmentId, date: day, store: str(b.store, 'Store / account', { max: 100 }),
+        departmentId, teamId: teamFor(ctx, departmentId, existing ? (b.teamId !== undefined ? b.teamId : existing.teamId) : b.teamId), date: day, store: str(b.store, 'Store / account', { max: 100 }),
         orders: int(b.orders ?? 0, 'Orders', { min: 0, max: 1e7 }), investment: num(b.investment ?? 0, 'Investment', { min: 0 }),
         revenue: num(b.revenue ?? 0, 'Sales', { min: 0 }), expenses: num(b.expenses ?? 0, 'Expenses', { min: 0 }),
         note: str(b.note, 'Note', { max: 300 }), custom: JSON.stringify(cf.sanitize('finance', b.custom, existing ? parseJson(existing.custom, {}) : {})),
@@ -61,14 +80,15 @@ module.exports = {
     m.get('/api/finance', { roles: lead }, (ctx) => {
       const q = ctx.query;
       const dept = ctx.scopeDept(q.departmentId);
+      const team = ctx.scopeTeam(q.teamId);
       const { from, to } = range(q);
       const rows = db.all(
-        `${SELECT} WHERE f.date BETWEEN ? AND ? AND (? IS NULL OR f.department_id=?) AND (? IS NULL OR f.store LIKE ? OR f.note LIKE ?)
+        `${SELECT} WHERE f.date BETWEEN ? AND ? AND (? IS NULL OR f.department_id=?) AND (? IS NULL OR f.team_id=?) AND (? IS NULL OR f.store LIKE ? OR f.note LIKE ?)
           ORDER BY f.date DESC, f.id DESC LIMIT 3000`,
-        from, to, dept, dept, q.search ? `%${q.search}%` : null, `%${q.search}%`, `%${q.search}%`).map(shape);
+        from, to, dept, dept, team, team, q.search ? `%${q.search}%` : null, `%${q.search}%`, `%${q.search}%`).map(shape);
       if (q.format === 'csv') {
         return ctx.csv('finance.csv', [
-          { label: 'Date', key: 'date' }, { label: 'Department', key: 'departmentName' }, { label: 'Store', key: 'store' },
+          { label: 'Date', key: 'date' }, { label: 'Department', key: 'departmentName' }, { label: 'Team', key: 'teamName' }, { label: 'Store', key: 'store' },
           { label: 'Orders', key: 'orders' }, { label: 'Investment', key: 'investment' }, { label: 'Sales', key: 'revenue' },
           { label: 'Expenses', key: 'expenses' }, { label: 'Profit', value: (r) => round(r.profit) }, { label: 'Note', key: 'note' },
           ...cf.definitions('finance').map((d) => ({ label: d.label, value: (r) => r.custom[d.key] })),
@@ -81,16 +101,19 @@ module.exports = {
       const q = ctx.query;
       const dept = ctx.scopeDept(q.departmentId);
       const { from, to } = range(q);
-      const rows = db.all('SELECT * FROM finance_entries WHERE date BETWEEN ? AND ? AND (? IS NULL OR department_id=?)', from, to, dept, dept);
+      const team = ctx.scopeTeam(q.teamId);
+      const rows = db.all('SELECT * FROM finance_entries WHERE date BETWEEN ? AND ? AND (? IS NULL OR department_id=?) AND (? IS NULL OR team_id=?)', from, to, dept, dept, team, team);
       const group = (keyFn) => {
         const g = {};
         for (const r of rows) (g[keyFn(r)] ||= []).push(r);
         return g;
       };
       const names = Object.fromEntries(db.all('SELECT id, name, color FROM departments').map((d) => [d.id, d]));
+      const teamNames = Object.fromEntries(db.all('SELECT id, name FROM teams').map((t) => [t.id, t.name]));
       return {
         from, to, totals: totals(rows),
         byDepartment: Object.entries(group((r) => r.departmentId)).map(([id, rs]) => ({ departmentId: Number(id), name: names[id]?.name, color: names[id]?.color, ...totals(rs) })),
+        byTeam: Object.entries(group((r) => r.teamId ?? 0)).map(([id, rs]) => ({ teamId: Number(id) || null, name: Number(id) ? teamNames[id] : 'Department-wide', ...totals(rs) })),
         byMonth: Object.entries(group((r) => r.date.slice(0, 7))).sort().map(([month, rs]) => ({ month, ...totals(rs) })),
       };
     });
@@ -107,7 +130,7 @@ module.exports = {
       const id = int(ctx.params.id, 'Entry', { required: true });
       const old = db.get('SELECT * FROM finance_entries WHERE id=?', id);
       if (!old) throw new HttpError(404, 'Entry not found');
-      ctx.assertDept(old.departmentId);
+      mayUse(ctx, old);
       const e = input(ctx, old);
       db.update('finance_entries', id, { ...e, updatedAt: new Date().toISOString() });
       ctx.audit('update', 'finance', id, `${e.date}: ${e.orders} orders, sales ${e.revenue}, invest ${e.investment}`, e.departmentId);
@@ -118,7 +141,7 @@ module.exports = {
       const id = int(ctx.params.id, 'Entry', { required: true });
       const old = db.get('SELECT * FROM finance_entries WHERE id=?', id);
       if (!old) throw new HttpError(404, 'Entry not found');
-      ctx.assertDept(old.departmentId);
+      mayUse(ctx, old);
       db.run('DELETE FROM finance_entries WHERE id=?', id);
       ctx.audit('delete', 'finance', id, `${old.date}: sales ${old.revenue}, invest ${old.investment}`, old.departmentId);
       return { ok: true };

@@ -1,5 +1,6 @@
 'use strict';
 const auth = require('../../core/auth');
+const accounts = require('../../core/accounts');
 const config = require('../../core/config');
 const db = require('../../core/db');
 const settings = require('../../core/settings');
@@ -15,9 +16,22 @@ function startSession(ctx, info) {
   ctx.user = { role: info.role, label: info.label, departmentId: info.departmentId ?? null, employeeId: info.employeeId ?? null };
 }
 
-// A team leader's own name (set by the admin) is looked up fresh, so a change shows without signing in again.
-const leaderName = (u) => (u.role === 'leader' ? db.get('SELECT leader_name FROM departments WHERE id=?', u.departmentId)?.leaderName || null : null);
-const publicUser = (u) => u && { role: u.role, label: u.label, departmentId: u.departmentId, employeeId: u.employeeId, name: leaderName(u) };
+// What the website needs to know about whoever is signed in (name, department, team).
+function publicUser(u) {
+  if (!u) return null;
+  const out = { role: u.role, label: u.label, departmentId: u.departmentId, employeeId: u.employeeId, name: null, departmentName: null, teamId: null, teamName: null };
+  if (u.role === 'admin') return out;
+  const e = db.get('SELECT e.name, e.team_id, d.name AS department_name FROM employees e JOIN departments d ON d.id=e.department_id WHERE e.id=?', u.employeeId);
+  if (!e) return out;
+  out.name = e.name;
+  out.departmentName = e.departmentName;
+  // A leader's team is the one they lead; a member's is the one they belong to.
+  const team = u.role === 'leader'
+    ? db.get('SELECT id, name FROM teams WHERE leader_employee_id=? ORDER BY id LIMIT 1', u.employeeId)
+    : u.role === 'member' && e.teamId ? db.get('SELECT id, name FROM teams WHERE id=?', e.teamId) : null;
+  if (team) { out.teamId = team.id; out.teamName = team.name; }
+  return out;
+}
 
 function activeDepartment(id) {
   const dept = db.get('SELECT * FROM departments WHERE id=? AND active=1', id);
@@ -25,17 +39,23 @@ function activeDepartment(id) {
   return dept;
 }
 
+const LABELS = {
+  hod: (name) => `${name} (Head of Department)`,
+  leader: (name) => `${name} (Team Leader)`,
+  member: (name) => name,
+};
+
 module.exports = {
   id: 'auth',
   name: 'Sign-in & Security',
-  description: 'Portal passwords, member PINs, sessions and brute-force protection.',
+  description: 'Sign-in for the admin, heads of department, team leaders and members; sessions and brute-force protection.',
   core: true,
   ui: false, // no screens of its own: sign-in is part of the website shell
   order: 5,
 
   seed() {
     if (settings.get('adminHash')) return;
-    // ADMIN_PASSWORD lets a hosted deployment (Railway) start with a password you chose.
+    // ADMIN_PASSWORD lets a hosted deployment (Railway, Render, a server) start with a password you chose.
     const fromEnv = process.env.ADMIN_PASSWORD;
     if (fromEnv && fromEnv.length >= 8) {
       settings.set('adminHash', auth.hashSecret(fromEnv));
@@ -54,22 +74,26 @@ module.exports = {
     m.get('/api/public/departments', () =>
       db.all('SELECT id, name, slug, color FROM departments WHERE active=1 ORDER BY sort, name'));
 
-    // Step 1 of member sign-in: department member password unlocks the list of names.
+    // Team members: step 1 - the team's member password opens the list of that team's names.
     m.post('/api/auth/members', (ctx) => {
       const deptId = int(ctx.body.departmentId, 'Department', { required: true });
       const key = `members|${ctx.ip}|${deptId}`;
       auth.throttle.check(key);
-      const dept = activeDepartment(deptId);
-      if (!auth.verifySecret(String(ctx.body.password || ''), dept.memberHash)) {
+      activeDepartment(deptId);
+      const team = accounts.findTeamByPassword(deptId, String(ctx.body.password || ''));
+      if (!team) {
         auth.throttle.fail(key);
         throw new HttpError(401, 'Incorrect password');
       }
       auth.throttle.ok(key);
-      return db.all("SELECT id, emp_code, name FROM employees WHERE department_id=? AND status='active' ORDER BY name", deptId);
+      return {
+        team: { id: team.id, name: team.name },
+        members: db.all("SELECT id, emp_code, name FROM employees WHERE team_id=? AND role='member' AND status='active' ORDER BY name", team.id),
+      };
     });
 
     m.post('/api/auth/login', (ctx) => {
-      const portal = oneOf(ctx.body.portal, 'Portal', ['admin', 'leader', 'member'], { required: true });
+      const portal = oneOf(ctx.body.portal, 'Portal', ['admin', 'hod', 'leader', 'member'], { required: true });
       const password = String(ctx.body.password || '');
       if (!password) throw bad('Password is required');
       const deptId = portal === 'admin' ? 0 : int(ctx.body.departmentId, 'Department', { required: true });
@@ -90,33 +114,37 @@ module.exports = {
         return { user: publicUser(ctx.user) };
       }
 
-      const dept = activeDepartment(deptId);
-      if (portal === 'leader') {
-        if (!auth.verifySecret(password, dept.leaderHash)) denied();
+      activeDepartment(deptId);
+
+      // Head of department / team leader: one password each; the password tells us who is signing in.
+      if (portal === 'hod' || portal === 'leader') {
+        const person = accounts.findEmployeeByPassword(deptId, portal === 'hod' ? 'hod' : 'team_leader', password);
+        if (!person) denied();
         auth.throttle.ok(key);
-        startSession(ctx, { role: 'leader', departmentId: deptId, label: `Team Leader - ${dept.name}` });
-        ctx.audit('login', 'portal', null, 'Team leader portal', deptId);
+        startSession(ctx, { role: portal, departmentId: deptId, employeeId: person.id, label: LABELS[portal](person.name) });
+        ctx.audit('login', 'portal', person.id, portal === 'hod' ? 'Head of department portal' : 'Team leader portal', deptId);
         return { user: publicUser(ctx.user) };
       }
 
-      // member: department password + personal PIN
-      if (!auth.verifySecret(password, dept.memberHash)) denied();
+      // Member: the team's member password (it identifies the team) + the person's own PIN.
+      const team = accounts.findTeamByPassword(deptId, password);
+      if (!team) denied();
       const employeeId = int(ctx.body.employeeId, 'Employee', { required: true });
       const pinKey = `pin|${ctx.ip}|${employeeId}`;
       auth.throttle.check(pinKey);
-      const emp = db.get("SELECT * FROM employees WHERE id=? AND department_id=? AND status='active'", employeeId, deptId);
+      const emp = db.get("SELECT * FROM employees WHERE id=? AND team_id=? AND role='member' AND status='active'", employeeId, team.id);
       if (!emp || !auth.verifySecret(String(ctx.body.pin || ''), emp.pinHash)) {
         auth.throttle.fail(pinKey);
         denied('Incorrect PIN');
       }
       auth.throttle.ok(key);
       auth.throttle.ok(pinKey);
-      startSession(ctx, { role: 'member', departmentId: deptId, employeeId: emp.id, label: emp.name });
+      startSession(ctx, { role: 'member', departmentId: deptId, employeeId: emp.id, label: LABELS.member(emp.name) });
       ctx.audit('login', 'portal', emp.id, 'Member portal', deptId);
       return { user: publicUser(ctx.user) };
     });
 
-    m.post('/api/auth/logout', { roles: ['admin', 'leader', 'member'] }, (ctx) => {
+    m.post('/api/auth/logout', { roles: ['admin', 'hod', 'leader', 'member'] }, (ctx) => {
       ctx.audit('logout', 'portal', null, null);
       auth.destroySession(ctx.user.tokenHash);
       ctx.res.setHeader('Set-Cookie', cookie('', 0));

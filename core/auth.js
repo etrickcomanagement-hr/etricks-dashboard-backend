@@ -36,9 +36,11 @@ function sessionFromToken(token) {
     db.run('DELETE FROM sessions WHERE token_hash=?', s.tokenHash);
     return null;
   }
-  if (s.role === 'member') {
-    const e = db.get('SELECT status FROM employees WHERE id=?', s.employeeId);
-    if (!e || e.status !== 'active') {
+  const EMPLOYEE_ROLE = { member: 'member', leader: 'team_leader', hod: 'hod' };
+  if (EMPLOYEE_ROLE[s.role]) {
+    // members, team leaders and heads are people: the account must still exist, be active and keep the same role
+    const e = db.get('SELECT status, role, department_id FROM employees WHERE id=?', s.employeeId);
+    if (!e || e.status !== 'active' || e.role !== EMPLOYEE_ROLE[s.role] || e.departmentId !== s.departmentId) {
       db.run('DELETE FROM sessions WHERE token_hash=?', s.tokenHash);
       return null;
     }

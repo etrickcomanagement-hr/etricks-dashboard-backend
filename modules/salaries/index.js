@@ -4,10 +4,11 @@ const notify = require('../../core/notify');
 const { HttpError, int, str, num, oneOf, date, today, bad, round } = require('../../core/util');
 
 /*
- * Salary payments.
- *   Team members are paid and tracked by their department's Team Leader portal.
- *   Team leaders (one salary per department leader) are paid and tracked by the Admin portal.
- *   Every payment must be confirmed by the person it was paid to ("received" / "not received").
+ * Salary payments. Everyone who works for eTricks is paid as a person (payee_type 'member' = an employee of any role):
+ *   a team leader pays and tracks the members of their team,
+ *   the head of department also tracks team leaders and members of the department,
+ *   the admin tracks everybody, including the heads.
+ * Every payment must be confirmed by the person it was paid to ("received" / "not received").
  */
 const PERIOD = /^\d{4}-(0[1-9]|1[0-2])$/;
 const thisMonth = () => today().slice(0, 7);
@@ -16,25 +17,20 @@ const period = (v) => {
   if (!PERIOD.test(p)) throw bad('Month must look like 2026-10');
   return p;
 };
+const TYPE = 'member';
 
-function payeeInfo(type, refId) {
-  if (type === 'member') {
-    const e = db.get('SELECT e.id, e.name, e.emp_code, e.department_id, e.designation, d.name AS department_name FROM employees e JOIN departments d ON d.id=e.department_id WHERE e.id=?', refId);
-    return e && { type, refId: e.id, name: e.name, code: e.empCode, departmentId: e.departmentId, departmentName: e.departmentName, designation: e.designation };
-  }
-  const d = db.get('SELECT id, name, leader_name FROM departments WHERE id=?', refId);
-  if (!d) return null;
-  const rate = db.get("SELECT payee_name FROM salary_rates WHERE payee_type='leader' AND ref_id=?", refId);
-  return { type, refId: d.id, name: d.leaderName || rate?.payeeName || `${d.name} team leader`, code: null, departmentId: d.id, departmentName: d.name, designation: 'Team leader' };
+function payeeInfo(refId) {
+  const e = db.get('SELECT e.id, e.name, e.emp_code, e.role, e.department_id, e.team_id, e.designation, d.name AS department_name FROM employees e JOIN departments d ON d.id=e.department_id WHERE e.id=?', refId);
+  return e && { type: TYPE, refId: e.id, name: e.name, code: e.empCode, role: e.role, departmentId: e.departmentId, teamId: e.teamId, departmentName: e.departmentName, designation: e.designation };
 }
 
-// Leaders manage their own department's members; only the admin manages leaders.
+// Same rule as everywhere else: you manage the people below you.
 function assertCanManage(ctx, payee) {
-  if (ctx.user.role === 'admin') return;
-  if (payee.type !== 'member' || payee.departmentId !== ctx.user.departmentId) throw new HttpError(403, 'You cannot manage this salary');
+  const person = { id: payee.refId, role: payee.role, departmentId: payee.departmentId, teamId: payee.teamId };
+  if (!ctx.canManage(person)) throw new HttpError(403, 'You cannot manage this salary');
 }
 
-const rateOf = (type, refId) => db.get('SELECT * FROM salary_rates WHERE payee_type=? AND ref_id=?', type, refId);
+const rateOf = (refId) => db.get('SELECT * FROM salary_rates WHERE payee_type=? AND ref_id=?', TYPE, refId);
 
 function paymentsFor(recordIds) {
   if (!recordIds.length) return {};
@@ -57,9 +53,8 @@ function summarise(record, payments, rate) {
   };
 }
 
-// The person (or portal) a salary belongs to, and who manages it.
-const payeeTarget = (payee) => (payee.type === 'member' ? { role: 'member', employeeId: payee.refId } : { role: 'leader', departmentId: payee.refId });
-const managerTarget = (payee) => (payee.type === 'member' ? { role: 'leader', departmentId: payee.departmentId } : { role: 'admin' });
+// Who is told when a payee confirms: the people above them (leader / head / admin).
+const tellManagers = (payee, payload) => { for (const to of notify.superiorsOf(payee.refId)) notify.send(to, payload); };
 
 function loadPayment(id) {
   const p = db.get(
@@ -72,7 +67,7 @@ function loadPayment(id) {
 module.exports = {
   id: 'salaries',
   name: 'Salaries',
-  description: 'Salary payments to team members and team leaders, confirmed by the person who was paid.',
+  description: 'Salary payments to members, team leaders and heads, confirmed by the person who was paid.',
   order: 66,
 
   migrations: [
@@ -89,41 +84,47 @@ module.exports = {
        confirm_status TEXT NOT NULL DEFAULT 'pending', confirmed_at TEXT, confirm_note TEXT, paid_by TEXT,
        created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
      CREATE INDEX idx_salpay_date ON salary_payments(paid_date);`,
+    // 2: the old "department leader" salaries (they had no person behind them) are kept apart, nothing is deleted
+    `UPDATE salary_rates SET payee_type='legacy_leader' WHERE payee_type='leader';
+     UPDATE salary_records SET payee_type='legacy_leader' WHERE payee_type='leader';`,
   ],
 
   routes(m) {
-    const lead = ['admin', 'leader'];
+    const lead = ['admin', 'hod', 'leader'];
+    const self = ['hod', 'leader', 'member'];
 
-    // ---- manage (leader: own members, admin: members + leaders) ----
+    // ---- manage: the people below you ----
     m.get('/api/salaries', { roles: lead }, (ctx) => {
       const q = ctx.query;
-      const type = ctx.user.role === 'leader' ? 'member' : oneOf(q.type, 'Type', ['member', 'leader'], { def: 'member' });
       const per = q.period ? period(q.period) : thisMonth();
       const dept = ctx.scopeDept(q.departmentId);
+      const team = ctx.scopeTeam(q.teamId);
       const search = q.search ? `%${q.search}%` : null;
+      const role = oneOf(q.role, 'Role', ['member', 'team_leader', 'hod'], { def: null });
 
-      let payees;
-      if (type === 'member') {
-        payees = db.all(
-          `SELECT e.id, e.name, e.emp_code, e.designation, e.department_id, d.name AS department_name FROM employees e JOIN departments d ON d.id=e.department_id
-            WHERE (e.status='active' OR EXISTS (SELECT 1 FROM salary_records r WHERE r.payee_type='member' AND r.ref_id=e.id AND r.period=?))
-              AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR e.name LIKE ? OR e.emp_code LIKE ?) ORDER BY d.sort, e.name`,
-          per, dept, dept, search, search, search)
-          .map((e) => ({ type, refId: e.id, name: e.name, code: e.empCode, designation: e.designation, departmentId: e.departmentId, departmentName: e.departmentName }));
-      } else {
-        payees = db.all('SELECT id FROM departments WHERE active=1 AND (? IS NULL OR id=?) ORDER BY sort, name', dept, dept).map((d) => payeeInfo('leader', d.id));
-      }
-      const records = Object.fromEntries(db.all('SELECT * FROM salary_records WHERE payee_type=? AND period=?', type, per).map((r) => [r.refId, r]));
+      const payees = db.all(
+        `SELECT e.id, e.name, e.emp_code, e.designation, e.role, e.department_id, e.team_id, d.name AS department_name, t.name AS team_name
+           FROM employees e JOIN departments d ON d.id=e.department_id LEFT JOIN teams t ON t.id=e.team_id
+          WHERE instr(?, ',' || e.role || ',') > 0
+            AND (e.status='active' OR EXISTS (SELECT 1 FROM salary_records r WHERE r.payee_type='member' AND r.ref_id=e.id AND r.period=?))
+            AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR e.team_id=?) AND (? IS NULL OR e.role=?)
+            AND (? IS NULL OR e.name LIKE ? OR e.emp_code LIKE ?)
+          ORDER BY d.sort, CASE e.role WHEN 'hod' THEN 0 WHEN 'team_leader' THEN 1 ELSE 2 END, t.name, e.name`,
+        ctx.rolesCsv(), per, dept, dept, team, team, role, role, search, search, search)
+        .map((e) => ({ type: TYPE, refId: e.id, name: e.name, code: e.empCode, designation: e.designation, role: e.role, departmentId: e.departmentId, departmentName: e.departmentName, teamId: e.teamId, teamName: e.teamName }));
+
+      const records = Object.fromEntries(db.all('SELECT * FROM salary_records WHERE payee_type=? AND period=?', TYPE, per).map((r) => [r.refId, r]));
       const pays = paymentsFor(Object.values(records).map((r) => r.id));
-      const rates = Object.fromEntries(db.all('SELECT * FROM salary_rates WHERE payee_type=?', type).map((r) => [r.refId, r]));
+      const rates = Object.fromEntries(db.all('SELECT * FROM salary_rates WHERE payee_type=?', TYPE).map((r) => [r.refId, r]));
 
       const rows = payees.map((p) => {
         const rec = records[p.refId];
         return { ...p, rate: rates[p.refId]?.amount || 0, ...summarise(rec, rec ? pays[rec.id] || [] : [], rates[p.refId]) };
       });
       if (q.format === 'csv') {
-        return ctx.csv(`salaries-${type}-${per}.csv`, [
-          { label: 'Month', value: () => per }, { label: 'Code', key: 'code' }, { label: 'Name', key: 'name' }, { label: 'Department', key: 'departmentName' },
+        return ctx.csv(`salaries-${per}.csv`, [
+          { label: 'Month', value: () => per }, { label: 'Code', key: 'code' }, { label: 'Name', key: 'name' }, { label: 'Role', key: 'role' },
+          { label: 'Department', key: 'departmentName' }, { label: 'Team', key: 'teamName' },
           { label: 'Monthly salary', key: 'rate' }, { label: 'Due this month', key: 'due' }, { label: 'Paid', key: 'paid' }, { label: 'Remaining', key: 'remaining' },
           { label: 'Last paid on', key: 'lastPaidDate' }, { label: 'Status', key: 'status' },
           { label: 'Payments awaiting confirmation', key: 'pending' }, { label: 'Confirmed', key: 'confirmed' }, { label: 'Disputed', key: 'disputed' },
@@ -131,34 +132,30 @@ module.exports = {
       }
       const sum = (k) => round(rows.reduce((s, r) => s + r[k], 0));
       return {
-        type, period: per, rows,
+        period: per, rows,
         totals: { due: sum('due'), paid: sum('paid'), remaining: sum('remaining'), awaitingConfirmation: sum('pending'), disputed: sum('disputed') },
       };
     });
 
     // Full payment history of one person (all months).
     m.get('/api/salaries/history', { roles: lead }, (ctx) => {
-      const type = oneOf(ctx.query.type, 'Type', ['member', 'leader'], { required: true });
-      const payee = payeeInfo(type, int(ctx.query.refId, 'Person', { required: true }));
+      const payee = payeeInfo(int(ctx.query.refId, 'Person', { required: true }));
       if (!payee) throw new HttpError(404, 'Person not found');
       assertCanManage(ctx, payee);
-      const records = db.all('SELECT * FROM salary_records WHERE payee_type=? AND ref_id=? ORDER BY period DESC', type, payee.refId);
+      const records = db.all('SELECT * FROM salary_records WHERE payee_type=? AND ref_id=? ORDER BY period DESC', TYPE, payee.refId);
       const pays = paymentsFor(records.map((r) => r.id));
-      return { payee, rate: rateOf(type, payee.refId)?.amount || 0, records: records.map((r) => ({ period: r.period, ...summarise(r, pays[r.id] || [], null) })) };
+      return { payee, rate: rateOf(payee.refId)?.amount || 0, records: records.map((r) => ({ period: r.period, ...summarise(r, pays[r.id] || [], null) })) };
     });
 
     m.put('/api/salaries/rate', { roles: lead }, (ctx) => {
-      const type = oneOf(ctx.body.type, 'Type', ['member', 'leader'], { required: true });
-      const payee = payeeInfo(type, int(ctx.body.refId, 'Person', { required: true }));
+      const payee = payeeInfo(int(ctx.body.refId, 'Person', { required: true }));
       if (!payee) throw new HttpError(404, 'Person not found');
       assertCanManage(ctx, payee);
       const amount = num(ctx.body.amount, 'Monthly salary', { required: true, min: 0, max: 1e9 });
-      const name = type === 'leader' ? str(ctx.body.payeeName, 'Leader name', { max: 80 }) : null;
       db.run(
         `INSERT INTO salary_rates(payee_type, ref_id, amount, payee_name, updated_at) VALUES (?,?,?,?,?)
-         ON CONFLICT(payee_type, ref_id) DO UPDATE SET amount=excluded.amount, payee_name=COALESCE(excluded.payee_name, salary_rates.payee_name), updated_at=excluded.updated_at`,
-        type, payee.refId, amount, name, new Date().toISOString());
-      if (type === 'leader' && name) db.update('departments', payee.refId, { leaderName: name }); // one name for the leader everywhere
+         ON CONFLICT(payee_type, ref_id) DO UPDATE SET amount=excluded.amount, updated_at=excluded.updated_at`,
+        TYPE, payee.refId, amount, null, new Date().toISOString());
       ctx.audit('salary_set', 'salary', payee.refId, `${payee.name}: monthly salary ${amount}`, payee.departmentId);
       return { ok: true };
     });
@@ -166,8 +163,7 @@ module.exports = {
     // Records a payment (creating the month's salary record if needed).
     m.post('/api/salaries/payments', { roles: lead }, (ctx) => {
       const b = ctx.body;
-      const type = oneOf(b.type, 'Type', ['member', 'leader'], { required: true });
-      const payee = payeeInfo(type, int(b.refId, 'Person', { required: true }));
+      const payee = payeeInfo(int(b.refId, 'Person', { required: true }));
       if (!payee) throw new HttpError(404, 'Person not found');
       assertCanManage(ctx, payee);
       const per = period(b.period);
@@ -177,15 +173,15 @@ module.exports = {
       if (paidDate > today()) throw bad('Date paid cannot be in the future');
 
       const id = db.tx(() => {
-        let rec = db.get('SELECT * FROM salary_records WHERE payee_type=? AND ref_id=? AND period=?', type, payee.refId, per);
+        let rec = db.get('SELECT * FROM salary_records WHERE payee_type=? AND ref_id=? AND period=?', TYPE, payee.refId, per);
         const wantedDue = num(b.salaryAmount, 'Salary for the month', { min: 0.01, max: 1e9 });
-        const due = wantedDue ?? rec?.amountDue ?? rateOf(type, payee.refId)?.amount ?? 0;
+        const due = wantedDue ?? rec?.amountDue ?? rateOf(payee.refId)?.amount ?? 0;
         if (due <= 0) throw bad('Set a monthly salary first');
         const paidSoFar = rec ? db.get('SELECT COALESCE(SUM(amount),0) AS s FROM salary_payments WHERE record_id=?', rec.id).s : 0;
         if (paidSoFar + amount > due + 0.005) {
           throw bad(`This would make the total paid ${round(paidSoFar + amount)}, more than the salary of ${round(due)}. If it includes a bonus, raise "Salary for the month".`);
         }
-        if (!rec) rec = { id: db.insert('salary_records', { payeeType: type, refId: payee.refId, departmentId: payee.departmentId, period: per, amountDue: due, createdAt: new Date().toISOString() }).id };
+        if (!rec) rec = { id: db.insert('salary_records', { payeeType: TYPE, refId: payee.refId, departmentId: payee.departmentId, period: per, amountDue: due, createdAt: new Date().toISOString() }).id };
         else if (wantedDue != null && wantedDue !== rec.amountDue) db.update('salary_records', rec.id, { amountDue: wantedDue });
         const now = new Date().toISOString();
         return db.insert('salary_payments', {
@@ -194,13 +190,13 @@ module.exports = {
         }).id;
       });
       ctx.audit('salary_paid', 'salary', id, `${payee.name}: ${amount} for ${per} on ${paidDate}`, payee.departmentId);
-      notify.send(payeeTarget(payee), { title: 'Salary payment recorded', body: `${amount} paid on ${paidDate} for ${per}. Please confirm that you received it.`, link: '#/my-salary', kind: 'salary' });
+      notify.send({ employeeId: payee.refId }, { title: 'Salary payment recorded', body: `${amount} paid on ${paidDate} for ${per}. Please confirm that you received it.`, link: '#/my-salary', kind: 'salary' });
       return { id };
     });
 
     m.put('/api/salaries/payments/:id', { roles: lead }, (ctx) => {
       const p = loadPayment(int(ctx.params.id, 'Payment', { required: true }));
-      const payee = payeeInfo(p.payeeType, p.refId);
+      const payee = payeeInfo(p.refId);
       assertCanManage(ctx, payee);
       if (p.confirmStatus === 'confirmed') throw bad('This payment is already confirmed by the person who received it, so it cannot be changed');
       const amount = num(ctx.body.amount, 'Amount paid', { required: true, min: 0.01, max: 1e9 });
@@ -213,13 +209,13 @@ module.exports = {
         confirmStatus: 'pending', confirmedAt: null, confirmNote: null, updatedAt: new Date().toISOString(),
       });
       ctx.audit('salary_payment_edited', 'salary', p.id, `${payee.name}: ${amount} for ${p.period}`, payee.departmentId);
-      notify.send(payeeTarget(payee), { title: 'A salary payment was corrected', body: `Now ${amount} paid on ${paidDate} for ${p.period}. Please confirm again.`, link: '#/my-salary', kind: 'salary' });
+      notify.send({ employeeId: payee.refId }, { title: 'A salary payment was corrected', body: `Now ${amount} paid on ${paidDate} for ${p.period}. Please confirm again.`, link: '#/my-salary', kind: 'salary' });
       return { ok: true };
     });
 
     m.del('/api/salaries/payments/:id', { roles: lead }, (ctx) => {
       const p = loadPayment(int(ctx.params.id, 'Payment', { required: true }));
-      const payee = payeeInfo(p.payeeType, p.refId);
+      const payee = payeeInfo(p.refId);
       assertCanManage(ctx, payee);
       if (p.confirmStatus === 'confirmed') throw bad('Confirmed payments cannot be deleted');
       db.run('DELETE FROM salary_payments WHERE id=?', p.id);
@@ -227,31 +223,29 @@ module.exports = {
       return { ok: true };
     });
 
-    // ---- the person being paid: member (own salary) or team leader (department leader salary) ----
-    const myPayee = (ctx) => (ctx.user.role === 'member' ? payeeInfo('member', ctx.user.employeeId) : payeeInfo('leader', ctx.user.departmentId));
-
-    m.get('/api/salaries/me', { roles: ['member', 'leader'] }, (ctx) => {
-      const payee = myPayee(ctx);
-      const records = db.all('SELECT * FROM salary_records WHERE payee_type=? AND ref_id=? ORDER BY period DESC LIMIT 24', payee.type, payee.refId);
+    // ---- the person being paid: member, team leader or head sees and confirms their own salary ----
+    m.get('/api/salaries/me', { roles: self }, (ctx) => {
+      const payee = payeeInfo(ctx.user.employeeId);
+      const records = db.all('SELECT * FROM salary_records WHERE payee_type=? AND ref_id=? ORDER BY period DESC LIMIT 24', TYPE, payee.refId);
       const pays = paymentsFor(records.map((r) => r.id));
       const months = records.map((r) => ({ period: r.period, ...summarise(r, pays[r.id] || [], null) }));
       return {
-        payee: { name: payee.name, departmentName: payee.departmentName }, monthlySalary: rateOf(payee.type, payee.refId)?.amount || 0, months,
+        payee: { name: payee.name, departmentName: payee.departmentName }, monthlySalary: rateOf(payee.refId)?.amount || 0, months,
         awaitingConfirmation: months.reduce((s, x) => s + x.pending, 0),
       };
     });
 
-    m.post('/api/salaries/payments/:id/confirm', { roles: ['member', 'leader'] }, (ctx) => {
+    m.post('/api/salaries/payments/:id/confirm', { roles: self }, (ctx) => {
       const p = loadPayment(int(ctx.params.id, 'Payment', { required: true }));
-      const payee = myPayee(ctx);
-      if (p.payeeType !== payee.type || p.refId !== payee.refId) throw new HttpError(403, 'This payment was not made to you');
+      const payee = payeeInfo(ctx.user.employeeId);
+      if (p.payeeType !== TYPE || p.refId !== payee.refId) throw new HttpError(403, 'This payment was not made to you');
       if (p.confirmStatus === 'confirmed') throw bad('You already confirmed this payment');
       const status = oneOf(ctx.body.status, 'Answer', ['confirmed', 'disputed'], { required: true });
       const note = str(ctx.body.note, 'Note', { max: 300 });
       if (status === 'disputed' && !note) throw bad('Please tell us what is wrong (for example the amount you actually received)');
       db.update('salary_payments', p.id, { confirmStatus: status, confirmedAt: new Date().toISOString(), confirmNote: note, updatedAt: new Date().toISOString() });
       ctx.audit(status === 'confirmed' ? 'salary_confirmed' : 'salary_disputed', 'salary', p.id, `${payee.name}: ${p.amount} for ${p.period}${note ? ` - ${note}` : ''}`, payee.departmentId);
-      notify.send(managerTarget(payee), { title: status === 'confirmed' ? `${payee.name} confirmed their salary` : `${payee.name} says the salary was NOT received`, body: `${p.amount} for ${p.period}${note ? ` · ${note}` : ''}`, link: payee.type === 'member' ? '#/salaries' : '#/leader-salaries', kind: 'salary' });
+      tellManagers(payee, { title: status === 'confirmed' ? `${payee.name} confirmed their salary` : `${payee.name} says the salary was NOT received`, body: `${p.amount} for ${p.period}${note ? ` · ${note}` : ''}`, link: '#/salaries', kind: 'salary' });
       return { ok: true };
     });
   },

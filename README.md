@@ -18,7 +18,7 @@ The server of the eTricks Hub: sign-in, departments, employees, attendance, leav
 
 4. **Settings → Networking → Generate Domain.** Copy the address (for example `https://etricks-backend-production.up.railway.app`) and check `https://…/api/health` answers `{"ok":true}`.
 5. Put that address into `vercel.json` of the website repo (`etricks-dashboard`).
-6. Open the Vercel website, sign in to the **Admin portal** with `ADMIN_PASSWORD`, then go to **Departments → Passwords** and set the Team Leader and Team Member password of each department. (The six departments are created on first start with random passwords that nobody has seen.)
+6. Open the Vercel website, sign in to the **Admin portal** with `ADMIN_PASSWORD`, then go to **Departments**, click **Add head of department** for each department and set the head's name and password. The head then adds the teams, appoints the three team leaders (with their passwords) and sets each team's member password. (The six departments are created on first start; they have no head until you add one.)
 
 ## Deploy on Render instead
 

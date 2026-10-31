@@ -18,7 +18,7 @@ module.exports = {
   ],
 
   routes(m) {
-    m.get('/api/custom-fields', { roles: ['admin', 'leader', 'member'] }, (ctx) => {
+    m.get('/api/custom-fields', { roles: ['admin', 'hod', 'leader', 'member'] }, (ctx) => {
       const entity = oneOf(ctx.query.entity, 'Entity', cf.ENTITIES, { required: true });
       return cf.definitions(entity);
     });
