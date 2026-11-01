@@ -148,7 +148,7 @@ const METRIC_COLUMNS = [
   { label: 'Absent days', key: 'absentDays' }, { label: 'Late', key: 'lateCount' }, { label: 'Attendance %', key: 'attendanceRate' },
   { label: 'Avg hours/day', key: 'avgWorkedHours' }, { label: 'Tasks', key: 'tasksTotal' }, { label: 'Tasks done', key: 'tasksDone' },
   { label: 'Task completion %', key: 'taskRate' }, { label: 'On-time %', key: 'onTimeRate' }, { label: 'Overdue', key: 'tasksOverdue' },
-  { label: 'Hours logged', key: 'hoursLogged' }, { label: 'Units/orders handled', key: 'units' }, { label: 'Avg rating (1-5)', key: 'avgRating' },
+  { label: 'Hours logged', key: 'hoursLogged' }, { label: 'Avg rating (1-5)', key: 'avgRating' },
   { label: 'Score', key: 'score' },
 ];
 const FINANCE_COLUMNS = [
@@ -258,7 +258,7 @@ module.exports = {
         return ctx.csv(`member-report-${from}-to-${to}.csv`, [
           { label: 'Code', key: 'empCode' }, { label: 'Employee', key: 'name' }, { label: 'Role', key: 'role' }, { label: 'Department', key: 'departmentName' }, { label: 'Team', key: 'teamName' },
           { label: 'Attendance %', key: 'attendanceRate' }, { label: 'Present days', key: 'presentDays' }, { label: 'Absent days', key: 'absentDays' }, { label: 'Late', key: 'lateCount' },
-          { label: 'Orders taken', key: 'ordersTaken' }, { label: 'Investment', key: 'investment' }, { label: 'Sales', key: 'sales' }, { label: 'Profit', key: 'profit' },
+          { label: 'Orders received', key: 'ordersTaken' }, { label: 'Purchasing cost', key: 'investment' }, { label: 'Total sales', key: 'sales' }, { label: 'Profit', key: 'profit' },
           { label: 'Tasks done', key: 'tasksDone' }, { label: 'Tasks total', key: 'tasksTotal' }, { label: 'Complaints (period)', key: 'complaints' },
           { label: 'Open complaints', key: 'openComplaints' }, { label: 'Score', key: 'score' },
         ], rows);
@@ -300,6 +300,10 @@ module.exports = {
       const taskRows = db.all(
         `SELECT k.status, k.due_date, e.department_id, e.team_id FROM tasks k JOIN employees e ON e.id=k.assigned_to
           WHERE instr(?, ',' || e.role || ',') > 0 AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR e.team_id=?)`, rolesCsv, dept, dept, team, team);
+      const toReview = db.all(
+        `SELECT k.assigned_by_id, e.id AS eid, e.role, e.department_id, e.team_id FROM tasks k JOIN employees e ON e.id=k.assigned_to
+          WHERE k.status='pending_approval' AND instr(?, ',' || e.role || ',') > 0 AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR e.team_id=?)`, rolesCsv, dept, dept, team, team)
+        .filter((k) => ctx.user.role === 'admin' || k.assignedById === ctx.user.employeeId || (ctx.user.role === 'hod' && ctx.canManage({ id: k.eid, role: k.role, departmentId: k.departmentId, teamId: k.teamId }))).length;
       const fin = db.all('SELECT * FROM finance_entries WHERE date>=? AND (? IS NULL OR department_id=?) AND (? IS NULL OR team_id=?)', mFrom, dept, dept, team, team);
       const tot = { orders: 0, investment: 0, revenue: 0, expenses: 0 };
       for (const f of fin) for (const k of Object.keys(tot)) tot[k] += f[k];
@@ -347,7 +351,10 @@ module.exports = {
       return {
         date: day, scope: dept, team,
         today: { employees: stats.employees, present: stats.present, late: stats.late, onLeave: stats.onLeave, notMarked: stats.notMarked },
-        pending: { attendance: stats.pendingAttendance, leave: pendingLeave(dept, team) },
+        pending: {
+          attendance: stats.pendingAttendance, leave: pendingLeave(dept, team), tasks: toReview,
+          issues: db.get("SELECT COUNT(*) AS n FROM issues WHERE status IN ('open','in_review') AND ((? = 'admin' AND recipient_role='admin') OR recipient_id = ?)", ctx.user.role, ctx.user.employeeId ?? -1).n,
+        },
         tasks: {
           open: taskRows.filter((t) => t.status !== 'done').length,
           overdue: taskRows.filter((t) => t.status !== 'done' && t.dueDate && t.dueDate < day).length,

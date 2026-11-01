@@ -243,15 +243,37 @@ async function main() {
     check('leader cannot assign to a leader', (await leaderA2('POST', '/api/tasks', { title: 'Nope', assignedTo: lb.data.id })).status === 403);
     const myTasks = (await member('GET', '/api/tasks/me')).data;
     check('member sees task', myTasks.length === 1);
-    check('member completes task', (await member('POST', `/api/tasks/${myTasks[0].id}/status`, { status: 'done' })).status === 200);
-    const wl = await member('POST', '/api/worklogs', { summary: 'Listed 52 products', hours: 7.5, units: 52, taskId: myTasks[0].id });
-    check('daily work log', wl.status === 200);
+    const t0 = myTasks[0].id;
+    check('member starts the task', (await member('POST', `/api/tasks/${t0}/status`, { status: 'in_progress' })).data.status === 'in_progress');
+    check('member submits the finished task', (await member('POST', `/api/tasks/${t0}/submit`, { note: 'All 50 listed' })).data.status === 'pending_approval');
+    check('it stays "Pending approval", not completed', (await member('GET', '/api/tasks/me')).data[0].status === 'pending_approval');
+    check('the member cannot complete it by themselves or edit it meanwhile', (await member('POST', `/api/tasks/${t0}/status`, { status: 'in_progress' })).status === 400 && (await member('POST', `/api/tasks/${t0}/submit`, {})).status === 400);
+    check('the assigner is asked to review', (await leaderA2('GET', '/api/notifications?limit=100')).data.items.some((n) => /Ali Raza submitted a task for approval/.test(n.title)));
+    check('manager list shows the review button for the assigner only', (await leaderA2('GET', '/api/tasks')).data.find((t) => t.id === t0).canReview === true && (await hodNew('GET', '/api/tasks')).data.find((t) => t.id === t0).canReview === true);
+    check('the dashboard counts tasks to review', (await leaderA2('GET', '/api/dashboard')).data.pending.tasks === 1);
+    check('another team\'s leader cannot review', (await leaderB('POST', `/api/tasks/${t0}/review`, { decision: 'approve' })).status === 403);
+    check('manager cannot mark a submitted task done by editing it', (await leaderA2('PUT', `/api/tasks/${t0}`, { title: 'List 50 products', status: 'done' })).status === 400);
+    check('feedback is required to request changes or reject', (await leaderA2('POST', `/api/tasks/${t0}/review`, { decision: 'changes' })).status === 400 && (await leaderA2('POST', `/api/tasks/${t0}/review`, { decision: 'reject', note: '' })).status === 400);
+    check('leader requests changes with feedback', (await leaderA2('POST', `/api/tasks/${t0}/review`, { decision: 'changes', note: 'Titles are missing for 5 products' })).data.status === 'changes_requested');
+    const sent = (await member('GET', '/api/tasks/me')).data[0];
+    check('member sees the feedback and is notified', sent.status === 'changes_requested' && sent.reviewNote.includes('Titles') && (await member('GET', '/api/notifications?limit=100')).data.items.some((n) => /Changes requested on your task/.test(n.title)));
+    check('a reviewed task cannot be reviewed again until resubmitted', (await leaderA2('POST', `/api/tasks/${t0}/review`, { decision: 'approve' })).status === 400);
+    await member('POST', `/api/tasks/${t0}/submit`, { note: 'Fixed the titles' });
+    check('leader rejects the submission with a reason', (await leaderA2('POST', `/api/tasks/${t0}/review`, { decision: 'reject', note: 'Wrong store' })).data.status === 'rejected' && (await member('GET', '/api/notifications?limit=100')).data.items.some((n) => /submission was rejected/.test(n.title)));
+    check('member can restart a rejected task and submit again', (await member('POST', `/api/tasks/${t0}/status`, { status: 'in_progress' })).status === 200 && (await member('POST', `/api/tasks/${t0}/submit`, { note: 'Redone for the right store' })).status === 200);
+    check('approving completes the task', (await leaderA2('POST', `/api/tasks/${t0}/review`, { decision: 'approve', note: 'Good' })).data.status === 'done' && (await member('GET', '/api/tasks/me')).data[0].status === 'done');
+    check('member is told it was approved', (await member('GET', '/api/notifications?limit=100')).data.items.some((n) => /Your task was approved/.test(n.title)));
+    check('a completed task is locked', (await member('POST', `/api/tasks/${t0}/status`, { status: 'todo' })).status === 400);
+    const wl = await member('POST', '/api/worklogs', { summary: 'Listed 52 products', hours: 7.5, remarks: 'The label printer was slow, lost about an hour', taskId: t0 });
+    check('daily work log with remarks / issues (optional)', wl.status === 200 && (await member('POST', '/api/worklogs', { summary: 'Short day', hours: 2 })).status === 200);
+    check('remarks are visible to the leader and reported to them', (await leaderA2('GET', `/api/worklogs?from=${TODAY}&to=${TODAY}`)).data.some((l) => /label printer/.test(l.remarks)) && (await leaderA2('GET', '/api/notifications?limit=100')).data.items.some((n) => /added remarks \/ issues/.test(n.title)));
     check('leader rates work log', (await leaderA2('POST', `/api/worklogs/${wl.data.id}/review`, { rating: 5, note: 'Great' })).status === 200);
     check('other team cannot read or rate it', (await leaderB('GET', `/api/worklogs?from=${TODAY}&to=${TODAY}`)).data.length === 0 && (await leaderB('POST', `/api/worklogs/${wl.data.id}/review`, { rating: 1 })).status === 403);
     check('head gives a leader a task', (await hodNew('POST', '/api/tasks', { title: 'Weekly team report', assignedTo: la.data.id, dueDate: D(MON, 3) })).data.created === 1);
     const leaderTasks = (await leaderA2('GET', '/api/tasks/me')).data;
     check('leader sees the task from the head', leaderTasks.length === 1 && leaderTasks[0].title === 'Weekly team report');
-    check('leader completes it', (await leaderA2('POST', `/api/tasks/${leaderTasks[0].id}/status`, { status: 'done' })).status === 200);
+    check('leader submits it and the head (who assigned it) reviews it', (await leaderA2('POST', `/api/tasks/${leaderTasks[0].id}/submit`, {})).status === 200
+      && (await hodNew('GET', '/api/dashboard')).data.pending.tasks === 1 && (await hodNew('POST', `/api/tasks/${leaderTasks[0].id}/review`, { decision: 'approve' })).data.status === 'done');
     check('head sees tasks of all teams', (await hodNew('GET', '/api/tasks')).data.length === 2 && (await leaderA2('GET', '/api/tasks')).data.length === 1);
     check('team assignment by the head', (await hodNew('POST', '/api/tasks', { title: 'Beta cleanup', teamId: tB })).data.created === 1);
 
@@ -344,10 +366,10 @@ async function main() {
     console.log('Notifications');
     const leaderNotes = (await leaderA2('GET', '/api/notifications?limit=100')).data;
     check('leader notified when member checks in and out', leaderNotes.items.some((n) => /Ali Raza checked in/.test(n.title)) && leaderNotes.items.some((n) => /Ali Raza checked out/.test(n.title)));
-    check('leader notified of leave request and finished task', leaderNotes.items.some((n) => /requested leave/.test(n.title)) && leaderNotes.items.some((n) => /marked a task done/.test(n.title)));
+    check('leader notified of leave request and finished task', leaderNotes.items.some((n) => /requested leave/.test(n.title)) && leaderNotes.items.some((n) => /submitted a task for approval/.test(n.title)));
     const hodNotes = (await hodNew('GET', '/api/notifications?limit=100')).data;
     check('head notified when a team leader checks in', hodNotes.items.some((n) => /Lina Lead checked in/.test(n.title)));
-    check('head notified of the leader\'s leave request and task', hodNotes.items.some((n) => /Lina Lead requested leave/.test(n.title)) && hodNotes.items.some((n) => /Lina Lead marked a task done/.test(n.title)));
+    check('head notified of the leader\'s leave request and task', hodNotes.items.some((n) => /Lina Lead requested leave/.test(n.title)) && hodNotes.items.some((n) => /Lina Lead submitted a task for approval/.test(n.title)));
     const adminNotes = (await admin('GET', '/api/notifications?limit=100')).data;
     check('admin notified of leader and head attendance', adminNotes.items.some((n) => /Lina Lead checked in/.test(n.title)) && adminNotes.items.some((n) => /Hamza Head checked in/.test(n.title)));
     check('admin notified of the head\'s leave request', adminNotes.items.some((n) => /Hamza Head requested leave/.test(n.title)));
@@ -361,8 +383,9 @@ async function main() {
     console.log('Member orders');
     check('leader cannot report orders as a member', (await leaderA2('POST', '/api/orders', { date: TODAY, orders: 5 })).status === 403);
     check('member needs something to report', (await member2('POST', '/api/orders', { date: TODAY })).status === 400);
-    const ord = await member2('POST', '/api/orders', { date: TODAY, store: 'Main store', orders: 12, investment: 300, revenue: 900, note: 'Busy day' });
-    check('member reports orders, investment and sales', ord.status === 200);
+    const ord = await member2('POST', '/api/orders', { date: TODAY, market: 'Amazon US', store: 'Main store', orders: 12, investment: 300, revenue: 900, note: 'Busy day, two buyers asked for refunds' });
+    check('member sends a daily report: market, store name, orders, purchasing cost, total sales, notes', ord.status === 200);
+    check('market and notes are kept', (await member2('GET', `/api/orders/me?from=${TODAY}&to=${TODAY}`)).data.rows[0].market === 'Amazon US' && (await member2('GET', `/api/orders/me?from=${TODAY}&to=${TODAY}`)).data.rows[0].note.includes('refunds'));
     await member2('POST', '/api/orders', { date: YESTERDAY, orders: 8, investment: 100, revenue: 400 });
     const bm = client();
     await bm('POST', '/api/auth/login', { portal: 'member', departmentId: ebayId, password: 'BetaTeam-Pass-1', employeeId: bina.data.id, pin: bina.data.pin });
@@ -376,7 +399,8 @@ async function main() {
     check('admin sees member orders', (await admin('GET', `/api/orders?from=${YESTERDAY}&to=${TODAY}`)).data.totals.revenue === 1450);
     check('other department sees none', (await leaderZ('GET', `/api/orders?from=${YESTERDAY}&to=${TODAY}`)).data.totals.orders === 0);
     check('member cannot open the orders list', (await member2('GET', '/api/orders')).status === 403);
-    check('orders CSV export', (await leaderA2('GET', `/api/orders?from=${YESTERDAY}&to=${TODAY}&format=csv`)).data.includes('Main store'));
+    check('orders CSV export uses the new column names', (await leaderA2('GET', `/api/orders?from=${YESTERDAY}&to=${TODAY}&format=csv`)).data.includes('Main store') && (await leaderA2('GET', `/api/orders?from=${YESTERDAY}&to=${TODAY}&format=csv`)).data.includes('Purchasing cost') && (await leaderA2('GET', `/api/orders?from=${YESTERDAY}&to=${TODAY}&format=csv`)).data.includes('Amazon US'));
+    check('search finds a report by market', (await leaderA2('GET', `/api/orders?from=${YESTERDAY}&to=${TODAY}&search=Amazon`)).data.totals.orders === 12);
     check('member edits own entry', (await member2('PUT', `/api/orders/${ord.data.id}`, { date: TODAY, orders: 14, investment: 300, revenue: 950 })).status === 200);
 
     console.log('Complaints');
@@ -406,6 +430,46 @@ async function main() {
     check('member told it was resolved', (await member2('GET', '/api/notifications')).data.items.some((n) => /resolved/.test(n.title)));
     check('complaints list + CSV', (await leaderA2('GET', `/api/complaints?employeeId=${empId}`)).data.length === 2 && (await leaderA2('GET', '/api/complaints?format=csv')).data.includes('Missed deadline'));
     check('only admin can delete a complaint', (await leaderA2('DELETE', `/api/complaints/${cp.data.id}`)).status === 403 && (await hodNew('DELETE', `/api/complaints/${cp.data.id}`)).status === 403);
+
+    console.log('Complaints & issues raised by employees');
+    const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+    check('a member can write to leader, head or admin', (await member2('GET', '/api/issues/recipients')).data.map((r) => r.role).join() === 'leader,hod,admin');
+    check('a leader can write to head or admin, a head to the admin', (await leaderA2('GET', '/api/issues/recipients')).data.map((r) => r.role).join() === 'hod,admin' && (await hodNew('GET', '/api/issues/recipients')).data.map((r) => r.role).join() === 'admin');
+    const base = { recipient: 'leader', category: 'Store/Account Related', priority: 'urgent', subject: 'Store suspended', details: 'My store got a suspension notice today.', storeName: 'Main store' };
+    check('required fields are checked', (await member2('POST', '/api/issues', { ...base, subject: '' })).status === 400 && (await member2('POST', '/api/issues', { ...base, category: 'Nope' })).status === 400 && (await member2('POST', '/api/issues', { ...base, recipient: 'nobody' })).status === 400);
+    check('only pictures and PDFs up to 1 MB are accepted', (await member2('POST', '/api/issues', { ...base, attachments: [{ name: 'a.png', data: Buffer.from('not a picture at all, just text').toString('base64') }] })).status === 400
+      && (await member2('POST', '/api/issues', { ...base, attachments: [{ name: 'big.png', data: 'A'.repeat(1_500_000) }] })).status === 400
+      && (await member2('POST', '/api/issues', { ...base, attachments: [1, 2, 3, 4].map(() => ({ name: 'x.png', data: PNG })) })).status === 400);
+    const iss = await member2('POST', '/api/issues', { ...base, attachments: [{ name: 'screenshot.png', data: PNG }] });
+    check('member submits an urgent complaint with an attachment to the team leader', iss.status === 200);
+    const iid = iss.data.id;
+    check('the leader is notified (urgent)', (await leaderA2('GET', '/api/notifications?limit=100')).data.items.some((n) => /URGENT: New complaint from Ali Raza/.test(n.title)));
+    check('it is in the leader\'s inbox and in the member\'s submitted list', (await leaderA2('GET', '/api/issues')).data.some((i) => i.id === iid && i.submitterName === 'Ali Raza') && (await member2('GET', '/api/issues/me')).data[0].sentTo === 'Lina Lead');
+    check('PRIVATE: another team\'s leader and the head are not shown it', (await leaderB('GET', '/api/issues')).data.length === 0 && (await hodNew('GET', '/api/issues')).data.length === 0
+      && (await leaderB('GET', `/api/issues/${iid}`)).status === 404 && (await hodNew('GET', `/api/issues/${iid}`)).status === 404 && (await bm('GET', `/api/issues/${iid}`)).status === 404);
+    check('PRIVATE: attachments follow the same rule', (await leaderB('GET', `/api/issues/${iid}/files/1`)).status === 404 && (await hodNew('GET', `/api/issues/${iid}/files/1`)).status === 404);
+    const detail = (await leaderA2('GET', `/api/issues/${iid}`)).data;
+    check('the leader can open it, with the attachment', detail.canRespond && detail.files.length === 1 && detail.files[0].mime === 'image/png' && detail.storeName === 'Main store');
+    const dl = await leaderA2('GET', `/api/issues/${iid}/files/${detail.files[0].id}`);
+    check('the attachment downloads as a file (not shown inline)', dl.status === 200 && dl.headers.get('content-type') === 'image/png' && /attachment/.test(dl.headers.get('content-disposition')));
+    check('the admin can open every complaint', (await admin('GET', `/api/issues/${iid}`)).status === 200);
+    check('the member cannot change the status', (await member2('POST', `/api/issues/${iid}/messages`, { body: 'hello', status: 'resolved' })).status === 403);
+    check('the leader replies and the status moves to "In review"', (await leaderA2('POST', `/api/issues/${iid}/messages`, { body: 'Looking into it with the admin' })).data.status === 'in_review');
+    check('the member is notified of the reply and sees the thread', (await member2('GET', '/api/notifications?limit=100')).data.items.some((n) => /Your complaint is now "In review"/.test(n.title)) && (await member2('GET', `/api/issues/${iid}`)).data.messages.length === 1);
+    check('the leader resolves it', (await leaderA2('POST', `/api/issues/${iid}/messages`, { body: 'Appeal sent, store restored', status: 'resolved' })).data.status === 'resolved' && (await member2('GET', '/api/notifications?limit=100')).data.items.some((n) => /Your complaint is now "Resolved"/.test(n.title)));
+    check('a follow-up from the member reopens it and tells the leader', (await member2('POST', `/api/issues/${iid}/messages`, { body: 'It is suspended again' })).data.status === 'open' && (await leaderA2('GET', '/api/notifications?limit=100')).data.items.some((n) => /Ali Raza replied to their complaint/.test(n.title)));
+    check('an empty reply is refused', (await member2('POST', `/api/issues/${iid}/messages`, { body: '' })).status === 400);
+    const toAdmin = await member2('POST', '/api/issues', { recipient: 'admin', category: 'Team/Workplace', priority: 'normal', subject: 'About my senior', details: 'Private matter.' });
+    check('a member can go straight to the admin', toAdmin.status === 200 && (await admin('GET', '/api/notifications?limit=100')).data.items.some((n) => /New complaint from Ali Raza/.test(n.title)));
+    check('PRIVATE: nobody but the admin sees a complaint sent to the admin', (await leaderA2('GET', `/api/issues/${toAdmin.data.id}`)).status === 404 && (await hodNew('GET', `/api/issues/${toAdmin.data.id}`)).status === 404
+      && !(await leaderA2('GET', '/api/issues')).data.some((i) => i.id === toAdmin.data.id) && (await admin('GET', '/api/issues')).data.length === 2 && (await admin('GET', '/api/dashboard')).data.pending.issues === 1);
+    const lToHead = await leaderA2('POST', '/api/issues', { recipient: 'hod', category: 'General', subject: 'Need a second monitor', details: 'For the team.' });
+    check('a leader writes to the head, who answers', lToHead.status === 200 && (await hodNew('GET', '/api/issues')).data.length === 1 && (await hodNew('POST', `/api/issues/${lToHead.data.id}/messages`, { body: 'Approved', status: 'resolved' })).status === 200
+      && (await leaderA2('GET', '/api/issues/me')).data[0].status === 'resolved');
+    check('a leader or member cannot write to someone they should not', (await leaderA2('POST', '/api/issues', { recipient: 'leader', category: 'General', subject: 's', details: 'd' })).status === 400 && (await hodNew('POST', '/api/issues', { recipient: 'hod', category: 'General', subject: 's', details: 'd' })).status === 400);
+    check('the head writes to the admin', (await hodNew('POST', '/api/issues', { recipient: 'admin', category: 'Technical', subject: 'Printer', details: 'Broken' })).status === 200);
+    check('inbox filters work', (await admin('GET', '/api/issues?priority=urgent')).data.length === 1 && (await admin('GET', '/api/issues?status=resolved')).data.length === 1 && (await admin('GET', '/api/issues?search=Printer')).data.length === 1);
+    check('a member has no inbox', (await member2('GET', '/api/issues')).status === 403);
 
     console.log('Member reports');
     const rep = (await leaderA2('GET', `/api/reports/employee/${empId}?from=${TWO_AGO}&to=${TODAY}`)).data;

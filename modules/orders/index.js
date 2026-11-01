@@ -3,7 +3,7 @@ const db = require('../../core/db');
 const { HttpError, int, str, num, date, range, today, addDays, bad, round } = require('../../core/util');
 
 /*
- * Orders reported by each team member (orders received, money invested, sales made).
+ * Daily reports from each team member: market, store, orders received, purchasing cost, total sales and notes.
  * A team leader sees their team, the head of department all teams of the department, the admin everyone. These figures are the members' own
  * daily reports; they are NOT added to the department Finance page automatically (avoids double counting).
  */
@@ -34,6 +34,8 @@ module.exports = {
        revenue REAL NOT NULL DEFAULT 0, note TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
      CREATE INDEX idx_mo_emp ON member_orders(employee_id, date);
      CREATE INDEX idx_mo_dept ON member_orders(department_id, date);`,
+    // 2: the market the report is about (free text)
+    'ALTER TABLE member_orders ADD COLUMN market TEXT;',
   ],
 
   routes(m) {
@@ -44,11 +46,11 @@ module.exports = {
       if (day > today()) throw bad('Date cannot be in the future');
       if (day < addDays(today(), -31)) throw bad('You can only report orders from the last 31 days');
       const e = {
-        date: day, store: str(b.store, 'Store / account', { max: 100 }), orders: int(b.orders ?? 0, 'Orders', { min: 0, max: 1e6 }),
-        investment: num(b.investment ?? 0, 'Investment', { min: 0, max: 1e9 }), revenue: num(b.revenue ?? 0, 'Sales', { min: 0, max: 1e9 }),
-        note: str(b.note, 'Note', { max: 300 }),
+        date: day, market: str(b.market, 'Market', { max: 100 }), store: str(b.store, 'Store name', { max: 100 }), orders: int(b.orders ?? 0, 'Orders', { min: 0, max: 1e6 }),
+        investment: num(b.investment ?? 0, 'Purchasing cost', { min: 0, max: 1e9 }), revenue: num(b.revenue ?? 0, 'Total sales', { min: 0, max: 1e9 }),
+        note: str(b.note, 'Notes / activities', { max: 1000 }),
       };
-      if (!e.orders && !e.investment && !e.revenue) throw bad('Enter at least orders, investment or sales');
+      if (!e.orders && !e.investment && !e.revenue && !e.note) throw bad('Enter at least orders, purchasing cost, total sales or a note');
       return e;
     };
 
@@ -63,7 +65,7 @@ module.exports = {
       const e = input(ctx.body);
       const now = new Date().toISOString();
       const r = db.insert('member_orders', { ...e, employeeId: ctx.user.employeeId, departmentId: ctx.user.departmentId, createdAt: now, updatedAt: now });
-      ctx.audit('orders_reported', 'orders', r.id, `${e.date}: ${e.orders} orders, sales ${e.revenue}, investment ${e.investment}`);
+      ctx.audit('orders_reported', 'orders', r.id, `${e.date}: ${e.orders} orders, total sales ${e.revenue}, purchasing cost ${e.investment}`);
       return { id: r.id };
     });
 
@@ -77,7 +79,7 @@ module.exports = {
       const o = own(ctx);
       const e = input(ctx.body);
       db.update('member_orders', o.id, { ...e, updatedAt: new Date().toISOString() });
-      ctx.audit('orders_edited', 'orders', o.id, `${e.date}: ${e.orders} orders, sales ${e.revenue}, investment ${e.investment}`);
+      ctx.audit('orders_edited', 'orders', o.id, `${e.date}: ${e.orders} orders, total sales ${e.revenue}, purchasing cost ${e.investment}`);
       return { ok: true };
     });
     m.del('/api/orders/:id', { roles: ['member'] }, (ctx) => {
@@ -96,14 +98,14 @@ module.exports = {
       const search = q.search ? `%${q.search}%` : null;
       const rows = db.all(
         `${SELECT} WHERE instr(?, ',' || e.role || ',') > 0 AND o.date BETWEEN ? AND ? AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR o.employee_id=?)
-            AND (? IS NULL OR e.team_id=?) AND (? IS NULL OR e.name LIKE ? OR e.emp_code LIKE ? OR o.store LIKE ?)
+            AND (? IS NULL OR e.team_id=?) AND (? IS NULL OR e.name LIKE ? OR e.emp_code LIKE ? OR o.store LIKE ? OR o.market LIKE ?)
           ORDER BY o.date DESC, e.name LIMIT 3000`,
-        ctx.rolesCsv(), from, to, dept, dept, q.employeeId || null, q.employeeId || null, team, team, search, search, search, search);
+        ctx.rolesCsv(), from, to, dept, dept, q.employeeId || null, q.employeeId || null, team, team, search, search, search, search, search);
       if (q.format === 'csv') {
         return ctx.csv('member-orders.csv', [
           { label: 'Date', key: 'date' }, { label: 'Code', key: 'empCode' }, { label: 'Employee', key: 'employeeName' }, { label: 'Department', key: 'departmentName' },
-          { label: 'Team', key: 'teamName' }, { label: 'Store', key: 'store' }, { label: 'Orders', key: 'orders' }, { label: 'Investment', key: 'investment' },
-          { label: 'Sales', key: 'revenue' }, { label: 'Profit', value: (r) => round(r.profit) }, { label: 'Note', key: 'note' },
+          { label: 'Team', key: 'teamName' }, { label: 'Market', key: 'market' }, { label: 'Store name', key: 'store' }, { label: 'Orders received', key: 'orders' }, { label: 'Purchasing cost', key: 'investment' },
+          { label: 'Total sales', key: 'revenue' }, { label: 'Profit', value: (r) => round(r.profit) }, { label: 'Notes / activities', key: 'note' },
         ], rows);
       }
       const by = {};

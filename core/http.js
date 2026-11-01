@@ -45,13 +45,13 @@ function parseCookies(header = '') {
   return out;
 }
 
-function readBody(req) {
+function readBody(req, limit = 1_000_000) {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
     req.on('data', (c) => {
       size += c.length;
-      if (size > 1_000_000) { reject(new HttpError(413, 'Request too large')); req.destroy(); return; }
+      if (size > limit) { reject(new HttpError(413, 'Request too large')); req.destroy(); return; }
       chunks.push(c);
     });
     req.on('end', () => {
@@ -117,7 +117,7 @@ async function handleApi(req, res, url) {
   }
   if (req.method !== 'GET' && req.headers['x-etricks'] !== '1') throw new HttpError(403, 'Missing request header');
 
-  const body = req.method === 'GET' ? {} : await readBody(req);
+  const body = req.method === 'GET' ? {} : await readBody(req, route.opts.maxBody);
   const ctx = buildCtx(req, url, params, user, body);
   ctx.res = res;
   const result = await route.handler(ctx);
