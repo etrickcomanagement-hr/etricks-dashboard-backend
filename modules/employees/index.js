@@ -156,7 +156,11 @@ module.exports = {
         if (old.shiftId !== e.shiftId) people.addHistory(old.id, 'shift_change', today(), `Shift: ${name('shifts', old.shiftId)} -> ${name('shifts', e.shiftId)}`, by);
         if (old.status !== e.status) people.addHistory(old.id, e.status === 'active' ? 'rejoined' : 'status_change', today(), `Status: ${old.status} -> ${e.status}`, by);
         // A leader who leaves no longer leads the team.
-        if (e.status !== 'active' && old.role === 'team_leader') db.run('UPDATE teams SET leader_employee_id=NULL WHERE leader_employee_id=?', old.id);
+        if (e.status !== 'active' && old.role === 'team_leader') {
+          const led = db.get('SELECT id, name FROM teams WHERE leader_employee_id=?', old.id);
+          db.run('UPDATE teams SET leader_employee_id=NULL WHERE leader_employee_id=?', old.id);
+          if (led) people.stepDown(old.id, led.name, by);
+        }
       });
       if (e.status !== 'active') db.run('DELETE FROM sessions WHERE employee_id=?', old.id);
       ctx.audit('update', 'employee', old.id, e.name, old.departmentId);
@@ -170,6 +174,38 @@ module.exports = {
       people.addHistory(e.id, type, date(ctx.body.eventDate, 'Date') || today(), str(ctx.body.details, 'Details', { required: true, max: 500 }), ctx.user.label);
       ctx.audit('history_added', 'employee', e.id, `${type}: ${e.name}`, e.departmentId);
       return { ok: true };
+    });
+
+    // Quick deactivate / reactivate (the record and all history stay).
+    m.post('/api/employees/:id/status', { roles: staff }, (ctx) => {
+      const e = load(ctx.params.id);
+      ctx.assertManage(e);
+      const status = oneOf(ctx.body.status, 'Status', STATUSES, { required: true });
+      if (status === e.status) throw bad(`This person is already ${status}`);
+      const note = str(ctx.body.note, 'Reason', { max: 300 });
+      db.tx(() => {
+        db.update('employees', e.id, { status });
+        people.addHistory(e.id, status === 'active' ? 'rejoined' : 'status_change', today(), `Status: ${e.status} -> ${status}${note ? `. ${note}` : ''}`, ctx.user.label);
+        if (status !== 'active' && e.role === 'team_leader') {
+          const led = db.get('SELECT id, name FROM teams WHERE leader_employee_id=?', e.id);
+          db.run('UPDATE teams SET leader_employee_id=NULL WHERE leader_employee_id=?', e.id);
+          if (led) people.stepDown(e.id, led.name, ctx.user.label);
+        }
+      });
+      if (status !== 'active') db.run('DELETE FROM sessions WHERE employee_id=?', e.id);
+      ctx.audit(status === 'active' ? 'reactivated' : 'deactivated', 'employee', e.id, `${e.name} (${e.empCode}): ${status}`, e.departmentId);
+      return { ok: true };
+    });
+
+    // Permanent delete: only for people the caller manages, never oneself, and never someone who was paid a salary.
+    m.del('/api/employees/:id', { roles: staff }, (ctx) => {
+      const e = load(ctx.params.id);
+      if (e.id === ctx.user.employeeId) throw bad('You cannot delete yourself');
+      ctx.assertManage(e);
+      const result = people.purge(e.id);
+      if (result.blocked) throw bad(`${e.name} cannot be deleted because ${result.blocked}. Deactivate the person instead: the history stays and they can no longer sign in.`);
+      ctx.audit('employee_deleted', 'employee', e.id, `${e.name} (${e.empCode}), ${e.role}: ${Object.entries(result.counts).filter(([, n]) => n).map(([k, n]) => `${n} ${k}`).join(', ') || 'no records'}`, e.departmentId);
+      return { ok: true, removed: result.counts };
     });
 
     // A member's own PIN (set by their leader, their head or the admin).

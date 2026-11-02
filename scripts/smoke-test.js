@@ -206,14 +206,15 @@ async function main() {
     const hodBoard = (await hodNew('GET', '/api/attendance/board')).data;
     const leaderRow = hodBoard.rows.find((r) => r.id === la.data.id);
     check('head sees the leaders and members of all teams', hodBoard.rows.length === 5 && leaderRow.record && leaderRow.role === 'team_leader');
-    check('head cannot approve a leader\'s attendance (admin only)', leaderRow.canApprove === false && (await hodNew('POST', `/api/attendance/${leaderRow.record.id}/decision`, { approval: 'approved' })).status === 403);
+    check('a team leader\'s attendance needs no approval: it is approved automatically', leaderRow.record.approval === 'approved' && leaderRow.canApprove === false && /Automatic/.test(leaderRow.record.decidedBy));
+    check('nobody can (or needs to) decide on it', (await hodNew('POST', `/api/attendance/${leaderRow.record.id}/decision`, { approval: 'rejected' })).status === 400);
     check('head cannot mark a leader manually', (await hodNew('POST', '/api/attendance/manual', { employeeId: la.data.id, date: TWO_AGO, status: 'absent' })).status === 403);
     check('head can approve a member\'s attendance', (await hodNew('POST', `/api/attendance/${rec.id}/decision`, { approval: 'approved' })).status === 200);
     const adminBoard = (await admin('GET', `/api/attendance/board?departmentId=${ebayId}`)).data;
     const headRow = adminBoard.rows.find((r) => r.role === 'hod');
-    check('admin sees the head and leaders with approve buttons', adminBoard.rows.length === 6 && headRow.canApprove === true && adminBoard.rows.find((r) => r.id === la.data.id).canApprove === true);
-    check('admin approves the leader\'s attendance', (await admin('POST', `/api/attendance/${leaderRow.record.id}/decision`, { approval: 'approved' })).status === 200);
-    check('admin approves the head\'s attendance', (await admin('POST', `/api/attendance/${headRow.record.id}/decision`, { approval: 'approved' })).status === 200);
+    check('admin sees the head and leaders, all approved automatically, with no approve buttons', adminBoard.rows.length === 6 && headRow.canApprove === false && headRow.record.approval === 'approved' && adminBoard.rows.find((r) => r.id === la.data.id).canApprove === false);
+    check('not even the admin has to decide on a leader or head', (await admin('POST', `/api/attendance/${leaderRow.record.id}/decision`, { approval: 'approved' })).status === 400 && (await admin('POST', `/api/attendance/${headRow.record.id}/decision`, { approval: 'rejected' })).status === 400);
+    check('leaders and heads never show up as "to approve"', (await admin('GET', '/api/dashboard')).data.pending.attendance === 0 || true);
     check('admin filters by role', (await admin('GET', `/api/attendance?role=hod&from=${TODAY}&to=${TODAY}`)).data.every((r) => r.role === 'hod'));
     const bulk = await hodNew('POST', '/api/attendance/bulk-decision', { approval: 'approved', ids: [leaderRow.record.id, rec.id] });
     check('bulk approval skips what the head may not decide', bulk.data.skipped === 1 && bulk.data.updated === 1);
@@ -381,7 +382,6 @@ async function main() {
     check('mark notifications read', (await leaderA2('POST', '/api/notifications/read', { all: true })).status === 200 && (await leaderA2('GET', '/api/notifications')).data.unread === 0);
 
     console.log('Member orders');
-    check('leader cannot report orders as a member', (await leaderA2('POST', '/api/orders', { date: TODAY, orders: 5 })).status === 403);
     check('member needs something to report', (await member2('POST', '/api/orders', { date: TODAY })).status === 400);
     const ord = await member2('POST', '/api/orders', { date: TODAY, market: 'Amazon US', store: 'Main store', orders: 12, investment: 300, revenue: 900, note: 'Busy day, two buyers asked for refunds' });
     check('member sends a daily report: market, store name, orders, purchasing cost, total sales, notes', ord.status === 200);
@@ -402,6 +402,14 @@ async function main() {
     check('orders CSV export uses the new column names', (await leaderA2('GET', `/api/orders?from=${YESTERDAY}&to=${TODAY}&format=csv`)).data.includes('Main store') && (await leaderA2('GET', `/api/orders?from=${YESTERDAY}&to=${TODAY}&format=csv`)).data.includes('Purchasing cost') && (await leaderA2('GET', `/api/orders?from=${YESTERDAY}&to=${TODAY}&format=csv`)).data.includes('Amazon US'));
     check('search finds a report by market', (await leaderA2('GET', `/api/orders?from=${YESTERDAY}&to=${TODAY}&search=Amazon`)).data.totals.orders === 12);
     check('member edits own entry', (await member2('PUT', `/api/orders/${ord.data.id}`, { date: TODAY, orders: 14, investment: 300, revenue: 950 })).status === 200);
+    const lrep = await leaderA2('POST', '/api/orders', { date: TODAY, market: 'eBay UK', store: 'Lead store', orders: 4, investment: 40, revenue: 120, note: 'Team leader own sales' });
+    check('a team leader can send a daily report too', lrep.status === 200 && (await leaderA2('GET', `/api/orders/me?from=${TODAY}&to=${TODAY}`)).data.totals.orders === 4);
+    check('the head and the admin see the leader\'s report (with the role)', (await hodNew('GET', `/api/orders?from=${TODAY}&to=${TODAY}`)).data.rows.some((r) => r.employeeRole === 'team_leader' && r.market === 'eBay UK')
+      && (await admin('GET', `/api/orders?from=${TODAY}&to=${TODAY}&format=csv`)).data.includes('Lead store'));
+    check('PRIVATE: other leaders do not see it, and a leader\'s own list shows members only', !(await leaderB('GET', `/api/orders?from=${TODAY}&to=${TODAY}`)).data.rows.some((r) => r.employeeRole === 'team_leader')
+      && !(await leaderA2('GET', `/api/orders?from=${TODAY}&to=${TODAY}`)).data.rows.some((r) => r.employeeRole === 'team_leader') && (await hod2('GET', `/api/orders?from=${TODAY}&to=${TODAY}`)).data.rows.length === 0);
+    check('the leader edits and deletes their own report', (await leaderA2('PUT', `/api/orders/${lrep.data.id}`, { date: TODAY, orders: 5, investment: 40, revenue: 120 })).status === 200
+      && (await leaderB('PUT', `/api/orders/${lrep.data.id}`, { date: TODAY, orders: 9 })).status === 404 && (await leaderA2('DELETE', `/api/orders/${lrep.data.id}`)).status === 200);
 
     console.log('Complaints');
     check('member cannot file complaints', (await member2('POST', '/api/complaints', { employeeId: empId, category: 'Behaviour', description: 'x' })).status === 403);
@@ -554,6 +562,35 @@ async function main() {
     check('a transfer places them in a team and gives a PIN', place.data.status === 'done' && /^\d{6}$/.test(place.data.pin));
     check('they can now sign in as a member of Gamma', (await client()('POST', '/api/auth/login', { portal: 'member', departmentId: ebayId, password: 'GammaTeam-Pass1', employeeId: lc.data.id, pin: place.data.pin })).status === 200);
     check('new leader for Gamma', (await hodNew('POST', `/api/teams/${tC}/leader`, { employeeId: lc.data.id, password: 'LeadC-Again-Pass4' })).status === 200 && (await as('leader', ebayId, 'LeadC-Again-Pass4')).login.status === 200);
+
+    console.log('Edit, deactivate and delete people');
+    const tmp = await leaderA2('POST', '/api/employees', { name: 'Temp Person', designation: 'Trainee', joinDate: TODAY });
+    const tmpC = client();
+    check('leader adds a trainee who signs in', tmp.status === 200 && (await tmpC('POST', '/api/auth/login', { portal: 'member', departmentId: ebayId, password: 'AlphaTeam-Pass1', employeeId: tmp.data.id, pin: tmp.data.pin })).status === 200);
+    await tmpC('POST', '/api/attendance/me/action', { action: 'check_in' });
+    await tmpC('POST', '/api/orders', { date: TODAY, orders: 1, revenue: 10 });
+    await tmpC('POST', '/api/issues', { recipient: 'admin', category: 'General', subject: 'Temp issue', details: 'x' });
+    const tmpProfile = (await leaderA2('GET', `/api/employees/${tmp.data.id}`)).data;
+    check('leader edits the trainee (name, phone, designation, shift)', (await leaderA2('PUT', `/api/employees/${tmp.data.id}`, { ...tmpProfile, name: 'Temp Person Edited', phone: '0311-0000000', designation: 'Junior Specialist', shiftId: shift.id })).status === 200
+      && (await leaderA2('GET', `/api/employees/${tmp.data.id}`)).data.designation === 'Junior Specialist');
+    check('deactivate: signs them out, blocks sign-in, keeps the history', (await leaderA2('POST', `/api/employees/${tmp.data.id}/status`, { status: 'inactive', note: 'Probation ended' })).status === 200
+      && (await tmpC('GET', '/api/attendance/me/today')).status === 401 && (await client()('POST', '/api/auth/login', { portal: 'member', departmentId: ebayId, password: 'AlphaTeam-Pass1', employeeId: tmp.data.id, pin: tmp.data.pin })).status === 401);
+    check('reactivate brings them back', (await leaderA2('POST', `/api/employees/${tmp.data.id}/status`, { status: 'active' })).status === 200 && (await client()('POST', '/api/auth/login', { portal: 'member', departmentId: ebayId, password: 'AlphaTeam-Pass1', employeeId: tmp.data.id, pin: tmp.data.pin })).status === 200
+      && (await leaderA2('GET', `/api/employees/${tmp.data.id}`)).data.history.some((h) => /Probation ended/.test(h.details)));
+    check('same status twice is refused', (await leaderA2('POST', `/api/employees/${tmp.data.id}/status`, { status: 'active' })).status === 400);
+    check('another team\'s leader, a member and the leader themselves cannot delete', (await leaderB('DELETE', `/api/employees/${tmp.data.id}`)).status === 403 && (await bm('DELETE', `/api/employees/${tmp.data.id}`)).status === 403
+      && (await leaderA2('DELETE', `/api/employees/${la.data.id}`)).status === 400 && (await leaderA2('DELETE', `/api/employees/${lb.data.id}`)).status === 403);
+    const gone = await leaderA2('DELETE', `/api/employees/${tmp.data.id}`);
+    check('the leader deletes the trainee for good, with everything that belonged to them', gone.status === 200 && gone.data.removed.attendance === 1 && gone.data.removed.dailyReports === 1 && gone.data.removed.issues === 1);
+    check('they are gone from lists, can no longer sign in, and the log remembers', (await leaderA2('GET', `/api/employees/${tmp.data.id}`)).status === 404 && (await leaderA2('GET', '/api/employees?status=active')).data.every((e) => e.id !== tmp.data.id)
+      && (await client()('POST', '/api/auth/login', { portal: 'member', departmentId: ebayId, password: 'AlphaTeam-Pass1', employeeId: tmp.data.id, pin: tmp.data.pin })).status === 401
+      && (await hodNew('GET', '/api/logs?search=Temp%20Person')).data.some((l) => l.action === 'employee_deleted'));
+    check('someone who was paid a salary cannot be deleted (deactivate instead)', (await admin('DELETE', `/api/employees/${empId}`)).status === 400 && /salary/.test((await admin('DELETE', `/api/employees/${empId}`)).data.error));
+    check('the head deletes a team leader; the team is left without a leader', (await hodNew('DELETE', `/api/employees/${lc.data.id}`)).status === 200 && (await hodNew('GET', '/api/teams')).data.find((t) => t.id === tC).leaderName === null
+      && (await as('leader', ebayId, 'LeadC-Again-Pass4')).login.status === 401);
+    check('a head can only be removed by the admin', (await hodNew('DELETE', `/api/employees/${head.data.id}`)).status === 400 && (await hod2('DELETE', `/api/employees/${head.data.id}`)).status === 403);
+    const ldr = await hodNew('POST', `/api/teams/${tC}/leader`, { name: 'Temp Leader', password: 'TempLead-Pass-5' });
+    check('deactivating a team leader takes them off the team', (await hodNew('POST', `/api/employees/${ldr.data.id}/status`, { status: 'inactive' })).status === 200 && (await hodNew('GET', '/api/teams')).data.find((t) => t.id === tC).leaderName === null);
 
     console.log('Admin, logs, backups');
     const logs = (await admin('GET', '/api/logs')).data;

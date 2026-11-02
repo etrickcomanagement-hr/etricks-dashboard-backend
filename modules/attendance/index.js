@@ -66,16 +66,18 @@ function loadForDecision(ctx, id) {
   if (!rec) throw new HttpError(404, 'Attendance record not found');
   const person = { id: rec.employeeId, role: rec.role, departmentId: rec.departmentId, teamId: rec.teamId };
   ctx.assertSee(person);
-  if (!ctx.canApprovePunch(person)) {
-    throw new HttpError(403, rec.role === 'member' ? 'You cannot decide on this attendance' : 'Attendance of team leaders and heads is checked by the admin');
-  }
+  if (rec.role !== 'member') throw bad('Attendance of team leaders and heads needs no approval');
+  if (!ctx.canApprovePunch(person)) throw new HttpError(403, 'You cannot decide on this attendance');
   return rec;
 }
 
 // Marks which rows the caller may approve (the screen shows the buttons only for those).
 const withApproval = (ctx, rows) => rows.map((r) => ({
-  ...r, canApprove: ctx.canApprovePunch({ id: r.employeeId, role: r.role, departmentId: r.departmentId, teamId: r.teamId }),
+  ...r, canApprove: r.role === 'member' && ctx.canApprovePunch({ id: r.employeeId, role: r.role, departmentId: r.departmentId, teamId: r.teamId }),
 }));
+
+// Team leaders and heads of department are trusted with their own attendance: it is approved automatically.
+const AUTO = 'Automatic (no approval needed)';
 
 module.exports = {
   id: 'attendance',
@@ -93,6 +95,9 @@ module.exports = {
      CREATE TABLE attendance_breaks (
        id INTEGER PRIMARY KEY, attendance_id INTEGER NOT NULL REFERENCES attendance(id) ON DELETE CASCADE,
        start_at TEXT NOT NULL, end_at TEXT);`,
+    // 2: attendance of team leaders and heads needs no approval (earlier pending days are approved)
+    `UPDATE attendance SET approval='approved', decided_by='Automatic (no approval needed)', decided_at=created_at
+      WHERE approval<>'approved' AND employee_id IN (SELECT id FROM employees WHERE role<>'member');`,
   ],
 
   routes(m) {
@@ -110,7 +115,10 @@ module.exports = {
       db.tx(() => {
         if (action === 'check_in') {
           if (db.get('SELECT 1 AS x FROM attendance WHERE employee_id=? AND date=?', empId, today())) throw bad('Attendance for today is already recorded');
-          db.insert('attendance', { employeeId: empId, date: today(), checkIn: nowIso, status: lateStatus(ownShift(empId)), createdAt: nowIso });
+          db.insert('attendance', {
+            employeeId: empId, date: today(), checkIn: nowIso, status: lateStatus(ownShift(empId)), createdAt: nowIso,
+            ...(ctx.user.role === 'member' ? {} : { approval: 'approved', decidedBy: AUTO, decidedAt: nowIso }),
+          });
           return;
         }
         const rec = openRecord(empId);
@@ -125,7 +133,7 @@ module.exports = {
         } else {
           if (openBreak) db.update('attendance_breaks', openBreak.id, { endAt: nowIso });
           // Re-submitting for approval whenever the day is closed keeps the leader's view current.
-          db.update('attendance', rec.id, { checkOut: nowIso, approval: rec.approval === 'rejected' ? 'pending' : rec.approval });
+          db.update('attendance', rec.id, { checkOut: nowIso, approval: ctx.user.role === 'member' && rec.approval === 'rejected' ? 'pending' : rec.approval });
         }
       });
       ctx.audit(action, 'attendance', null, null);
@@ -193,7 +201,7 @@ module.exports = {
       const leaves = new Set(db.all("SELECT employee_id FROM leave_requests WHERE status='approved' AND from_date<=? AND to_date>=?", day, day).map((l) => l.employeeId));
       const rows = emps.map((e) => ({
         ...e, record: recs[e.id] || null, onLeave: leaves.has(e.id),
-        canApprove: ctx.canApprovePunch({ id: e.id, role: e.role, departmentId: e.departmentId, teamId: e.teamId }),
+        canApprove: e.role === 'member' && ctx.canApprovePunch({ id: e.id, role: e.role, departmentId: e.departmentId, teamId: e.teamId }),
       }));
       const count = (fn) => rows.filter(fn).length;
       return {

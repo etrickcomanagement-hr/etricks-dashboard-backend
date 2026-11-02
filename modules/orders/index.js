@@ -8,7 +8,7 @@ const { HttpError, int, str, num, date, range, today, addDays, bad, round } = re
  * daily reports; they are NOT added to the department Finance page automatically (avoids double counting).
  */
 const SELECT = `
-  SELECT o.*, (o.revenue - o.investment) AS profit, e.name AS employee_name, e.emp_code, e.team_id,
+  SELECT o.*, (o.revenue - o.investment) AS profit, e.name AS employee_name, e.emp_code, e.team_id, e.role AS employee_role,
          d.name AS department_name, t.name AS team_name
     FROM member_orders o
     JOIN employees e ON e.id=o.employee_id
@@ -54,14 +54,16 @@ module.exports = {
       return e;
     };
 
-    // ---- member ----
-    m.get('/api/orders/me', { roles: ['member'] }, (ctx) => {
+    // ---- members and team leaders write their own daily report ----
+    // The admin and the head of department see the leaders' reports; a leader sees only the reports of their team's members.
+    const self = ['leader', 'member'];
+    m.get('/api/orders/me', { roles: self }, (ctx) => {
       const { from, to } = range(ctx.query);
       const rows = db.all(`${SELECT} WHERE o.employee_id=? AND o.date BETWEEN ? AND ? ORDER BY o.date DESC, o.id DESC`, ctx.user.employeeId, from, to);
       return { rows, totals: totals(rows) };
     });
 
-    m.post('/api/orders', { roles: ['member'] }, (ctx) => {
+    m.post('/api/orders', { roles: self }, (ctx) => {
       const e = input(ctx.body);
       const now = new Date().toISOString();
       const r = db.insert('member_orders', { ...e, employeeId: ctx.user.employeeId, departmentId: ctx.user.departmentId, createdAt: now, updatedAt: now });
@@ -75,14 +77,14 @@ module.exports = {
       if (o.date < addDays(today(), -7)) throw bad('Entries older than 7 days can no longer be changed. Please ask your team leader.');
       return o;
     };
-    m.put('/api/orders/:id', { roles: ['member'] }, (ctx) => {
+    m.put('/api/orders/:id', { roles: self }, (ctx) => {
       const o = own(ctx);
       const e = input(ctx.body);
       db.update('member_orders', o.id, { ...e, updatedAt: new Date().toISOString() });
       ctx.audit('orders_edited', 'orders', o.id, `${e.date}: ${e.orders} orders, total sales ${e.revenue}, purchasing cost ${e.investment}`);
       return { ok: true };
     });
-    m.del('/api/orders/:id', { roles: ['member'] }, (ctx) => {
+    m.del('/api/orders/:id', { roles: self }, (ctx) => {
       const o = own(ctx);
       db.run('DELETE FROM member_orders WHERE id=?', o.id);
       ctx.audit('orders_deleted', 'orders', o.id, `${o.date}: ${o.orders} orders`);
@@ -103,14 +105,14 @@ module.exports = {
         ctx.rolesCsv(), from, to, dept, dept, q.employeeId || null, q.employeeId || null, team, team, search, search, search, search, search);
       if (q.format === 'csv') {
         return ctx.csv('member-orders.csv', [
-          { label: 'Date', key: 'date' }, { label: 'Code', key: 'empCode' }, { label: 'Employee', key: 'employeeName' }, { label: 'Department', key: 'departmentName' },
+          { label: 'Date', key: 'date' }, { label: 'Code', key: 'empCode' }, { label: 'Employee', key: 'employeeName' }, { label: 'Role', key: 'employeeRole' }, { label: 'Department', key: 'departmentName' },
           { label: 'Team', key: 'teamName' }, { label: 'Market', key: 'market' }, { label: 'Store name', key: 'store' }, { label: 'Orders received', key: 'orders' }, { label: 'Purchasing cost', key: 'investment' },
           { label: 'Total sales', key: 'revenue' }, { label: 'Profit', value: (r) => round(r.profit) }, { label: 'Notes / activities', key: 'note' },
         ], rows);
       }
       const by = {};
-      for (const r of rows) (by[r.employeeId] ||= { employeeId: r.employeeId, name: r.employeeName, empCode: r.empCode, departmentName: r.departmentName, rows: [] }).rows.push(r);
-      const byEmployee = Object.values(by).map((g) => ({ employeeId: g.employeeId, name: g.name, empCode: g.empCode, departmentName: g.departmentName, ...totals(g.rows) }))
+      for (const r of rows) (by[r.employeeId] ||= { employeeId: r.employeeId, name: r.employeeName, empCode: r.empCode, role: r.employeeRole, departmentName: r.departmentName, rows: [] }).rows.push(r);
+      const byEmployee = Object.values(by).map((g) => ({ employeeId: g.employeeId, name: g.name, empCode: g.empCode, role: g.role, departmentName: g.departmentName, ...totals(g.rows) }))
         .sort((a, b) => b.revenue - a.revenue);
       const teams = {};
       for (const r of rows) (teams[r.teamId ?? 0] ||= { teamId: r.teamId, name: r.teamName || 'No team', rows: [] }).rows.push(r);
