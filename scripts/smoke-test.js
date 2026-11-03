@@ -703,6 +703,9 @@ async function main() {
       && (await client()('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'ali.traders', password: 'BrandNew-Pass-9' })).status === 401 && await ids(W1) === c2.data.username);
     await admin('PUT', `/api/clients/${c1.data.id}`, { status: 'active' });
     check('a deleted employee leaves the client numbers in place', (await leaderA2('DELETE', `/api/employees/${w1.data.id}`)).status === 200 && (await admin('GET', `/api/client-reports?clientId=${c1.data.id}&from=${YESTERDAY}&to=${TODAY}`)).data.rows.length >= 2);
+    const tEmpty = (await hod2('POST', '/api/teams', { name: 'Empty' })).data;
+    const cTeam = await admin('POST', '/api/clients', { departmentId: amazonId, teamId: tEmpty.id, username: 'team.client', password: cpw });
+    check('a team that still has a client cannot be deleted (and nothing crashes)', cTeam.status === 200 && (await hod2('DELETE', `/api/teams/${tEmpty.id}`)).status === 400 && (await admin('DELETE', `/api/clients/${cTeam.data.id}`)).status === 200 && (await hod2('DELETE', `/api/teams/${tEmpty.id}`)).status === 200);
     check('the admin deletes a client with everything of it', (await admin('DELETE', `/api/clients/${c3.data.id}`)).status === 200 && (await admin('GET', '/api/clients')).data.length === 2 && (await W2('DELETE', `/api/clients/${c2.data.id}`)).status === 403);
     check('client activity is in the log without any message text', (await admin('GET', '/api/logs?limit=500')).data.some((l) => l.action === 'client_created') && (await admin('GET', '/api/logs?limit=500')).data.some((l) => l.action === 'client_alert'));
     const cLock = await admin('POST', '/api/clients', { departmentId: ebayId, username: 'lock.test', password: cpw });
@@ -716,7 +719,7 @@ async function main() {
     const logs = (await admin('GET', '/api/logs')).data;
     check('activity log captured actions', logs.length > 10 && logs.some((l) => l.action === 'login') && logs.some((l) => l.action === 'login_failed') && logs.some((l) => l.action === 'transfer') && logs.some((l) => l.action === 'password_changed'));
     check('head sees only own department log; leaders have none', (await hodNew('GET', '/api/logs')).data.every((l) => l.departmentId === ebayId) && (await leaderA2('GET', '/api/logs')).status === 403);
-    check('manual backup', (await admin('POST', '/api/backups')).status === 200);
+    check('manual backup (pressed twice in a second is fine)', (await admin('POST', '/api/backups')).status === 200 && (await admin('POST', '/api/backups')).status === 200);
     check('backup list', (await admin('GET', '/api/backups')).data.length >= 2);
     check('backups admin only', (await hodNew('GET', '/api/backups')).status === 403);
     check('disable a module', (await admin('PUT', '/api/modules/finance', { enabled: false })).status === 200 && (await leaderA2('GET', '/api/finance')).status === 404);

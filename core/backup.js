@@ -13,7 +13,9 @@ function stamp(d = new Date()) {
 
 function create(kind = 'manual') {
   const name = `etricks-${kind}-${stamp()}.db`;
-  db.snapshotTo(path.join(config.backupDir, name));
+  const file = path.join(config.backupDir, name);
+  if (fs.existsSync(file)) return name; // pressed twice within the same second: the copy that was just made is the backup
+  db.snapshotTo(file);
   prune();
   return name;
 }

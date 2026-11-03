@@ -188,6 +188,7 @@ module.exports = {
       const t = loadTeam(int(ctx.params.id, 'Team', { required: true }));
       ctx.assertDept(t.departmentId);
       if (db.get('SELECT 1 AS x FROM employees WHERE team_id=?', t.id)) throw bad('Move everyone out of this team first (use Transfer), then delete it');
+      if (db.get('SELECT 1 AS x FROM clients WHERE team_id=?', t.id)) throw bad('A client is assigned to this team. Move that client to another team first (Clients page), then delete this team');
       db.run('DELETE FROM teams WHERE id=?', t.id);
       ctx.audit('delete', 'team', t.id, t.name, t.departmentId);
       return { ok: true };
