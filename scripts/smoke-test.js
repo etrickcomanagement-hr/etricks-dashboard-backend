@@ -592,6 +592,126 @@ async function main() {
     const ldr = await hodNew('POST', `/api/teams/${tC}/leader`, { name: 'Temp Leader', password: 'TempLead-Pass-5' });
     check('deactivating a team leader takes them off the team', (await hodNew('POST', `/api/employees/${ldr.data.id}/status`, { status: 'inactive' })).status === 200 && (await hodNew('GET', '/api/teams')).data.find((t) => t.id === tC).leaderName === null);
 
+    console.log('Client portal: sales, chat and urgent alerts');
+    const w1 = await leaderA2('POST', '/api/employees', { name: 'Worker One', joinDate: TODAY });
+    const w2 = await leaderA2('POST', '/api/employees', { name: 'Worker Two', joinDate: TODAY });
+    const W1 = client(); const W2 = client();
+    await W1('POST', '/api/auth/login', { portal: 'member', departmentId: ebayId, password: 'AlphaTeam-Pass1', employeeId: w1.data.id, pin: w1.data.pin });
+    await W2('POST', '/api/auth/login', { portal: 'member', departmentId: ebayId, password: 'AlphaTeam-Pass1', employeeId: w2.data.id, pin: w2.data.pin });
+    const cpw = 'ClientPass-123';
+    check('only the admin creates clients', (await hodNew('POST', '/api/clients', { departmentId: ebayId, password: cpw })).status === 403 && (await leaderA2('POST', '/api/clients', { departmentId: ebayId, password: cpw })).status === 403 && (await W1('POST', '/api/clients', { departmentId: ebayId, password: cpw })).status === 403);
+    check('client ID and password are validated', (await admin('POST', '/api/clients', { departmentId: ebayId, username: 'a b', password: cpw })).status === 400 && (await admin('POST', '/api/clients', { departmentId: ebayId, username: 'okname', password: 'short' })).status === 400
+      && (await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tZ, username: 'okname', password: cpw })).status === 400 && (await admin('POST', '/api/clients', { password: cpw })).status === 400);
+    const c1 = await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, username: 'ali.traders', password: cpw, displayName: 'Ali Traders Ltd', contact: '0300-9999999', secretInfo: 'Store login: seller@example.com / TopSecret!77' });
+    check('admin creates a client for a team', c1.status === 200 && c1.data.username === 'ali.traders');
+    check('the client ID is unique (any letter case)', (await admin('POST', '/api/clients', { departmentId: ebayId, username: 'ALI.TRADERS', password: cpw })).status === 400);
+    const c2 = await admin('POST', '/api/clients', { departmentId: ebayId, password: cpw, displayName: 'Second Client' });
+    check('the admin can let the system pick the ID', c2.status === 200 && /^CL-\d{4}$/.test(c2.data.username));
+    const c3 = await admin('POST', '/api/clients', { departmentId: amazonId, username: 'amazon.client', password: cpw });
+    const ids = async (c) => (await c('GET', '/api/clients')).data.map((x) => x.username).sort().join();
+    check('staff see only the clients of their department / team', await ids(W1) === `${c2.data.username},ali.traders` && await ids(bm) === c2.data.username && await ids(leaderA2) === `${c2.data.username},ali.traders` && await ids(leaderB) === c2.data.username
+      && await ids(hodNew) === `${c2.data.username},ali.traders` && await ids(hod2) === 'amazon.client' && (await admin('GET', '/api/clients')).data.length === 3);
+    const asMember = JSON.stringify((await W1('GET', '/api/clients')).data);
+    check('PRIVATE: staff see the client ID only, never the name, contact or secrets', !/Ali Traders|0300-9999999|TopSecret|displayName|contact|secret/i.test(asMember) && !/Ali Traders|TopSecret/.test(JSON.stringify((await hodNew('GET', '/api/clients')).data)));
+    check('PRIVATE: the secret details are for the admin, every view is logged', (await W1('GET', `/api/clients/${c1.data.id}/secret`)).status === 403 && (await hodNew('GET', `/api/clients/${c1.data.id}/secret`)).status === 403
+      && (await admin('GET', `/api/clients/${c1.data.id}/secret`)).data.secretInfo.includes('TopSecret') && (await admin('GET', '/api/logs?search=client_secret')).data.some((l) => l.action === 'client_secret_viewed'));
+    check('another team cannot open the client at all', (await bm('GET', `/api/clients/${c1.data.id}/chat?channel=inquiry`)).status === 404 && (await hod2('GET', `/api/clients/${c1.data.id}/chat?channel=inquiry`)).status === 404);
+
+    console.log('Client sign-in');
+    const CL = client(); const CL2 = client();
+    check('wrong password, wrong ID and wrong department are all refused the same way', (await client()('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'ali.traders', password: 'nope-nope-nope' })).status === 401
+      && (await client()('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'nobody', password: cpw })).status === 401 && (await client()('POST', '/api/auth/login', { portal: 'client', departmentId: amazonId, username: 'ali.traders', password: cpw })).status === 401);
+    const cli = await CL('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'ali.traders', password: cpw });
+    check('the client signs in with the ID and the password the admin set', cli.status === 200 && cli.data.user.role === 'client' && cli.data.user.username === 'ali.traders');
+    check('the client\'s own record carries no staff names', !/Worker|Lina|Hamza|Alpha/.test(JSON.stringify(cli.data)));
+    await CL2('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: c2.data.username, password: cpw });
+    check('a client cannot use any staff page', (await CL('GET', '/api/employees')).status === 403 && (await CL('GET', '/api/clients')).status === 403 && (await CL('GET', '/api/orders')).status === 403 && (await CL('GET', '/api/departments')).status === 403
+      && (await CL('GET', '/api/logs')).status === 403 && (await CL('POST', '/api/client-reports', { clientId: c1.data.id, date: TODAY, orders: 1 })).status === 403);
+    check('staff cannot use the client portal', (await W1('GET', '/api/portal/sales')).status === 403 && (await admin('GET', '/api/portal/sales')).status === 403 && (await hodNew('POST', '/api/portal/chat', { channel: 'inquiry', body: 'x' })).status === 403);
+    const cme = (await CL('GET', '/api/auth/me')).data;
+    check('a client gets only the settings it needs', cme.settings.currency && cme.settings.leaveTypes === undefined && (await CL('GET', '/api/settings')).data.scoreWeights === undefined);
+
+    console.log('Client sales (entered by team members)');
+    check('only people of that client\'s team can add an update', (await bm('POST', '/api/client-reports', { clientId: c1.data.id, date: TODAY, orders: 1 })).status === 404 && (await hod2('POST', '/api/client-reports', { clientId: c1.data.id, date: TODAY, orders: 1 })).status === 404);
+    check('updates are validated', (await W1('POST', '/api/client-reports', { clientId: c1.data.id, date: ymd(offset(2)), orders: 1 })).status === 400 && (await W1('POST', '/api/client-reports', { clientId: c1.data.id, date: TODAY })).status === 400
+      && (await W1('POST', '/api/client-reports', { clientId: c1.data.id, date: TODAY, orders: -1 })).status === 400);
+    const e1 = await W1('POST', '/api/client-reports', { clientId: c1.data.id, date: TODAY, market: 'Amazon US', store: 'Main', orders: 5, investment: 100, sales: 300, note: 'Listed 20 products, 2 orders shipped' });
+    const e2 = await W2('POST', '/api/client-reports', { clientId: c1.data.id, date: TODAY, market: 'eBay UK', orders: 3, investment: 50, sales: 120 });
+    await W1('POST', '/api/client-reports', { clientId: c1.data.id, date: YESTERDAY, orders: 2, investment: 40, sales: 90, note: 'Quiet day' });
+    check('team members add the day\'s work for the client ID', e1.status === 200 && e2.status === 200);
+    const sales = (await CL('GET', '/api/portal/sales')).data;
+    check('TODAY: orders, investment, sales and revenue (sales - investment)', sales.today.orders === 8 && sales.today.investment === 150 && sales.today.sales === 420 && sales.today.revenue === 270, JSON.stringify(sales.today));
+    check('DAILY: one row per day with that day\'s updates', sales.days.length === 2 && sales.days[0].date === TODAY && sales.days[0].updates.length === 2 && sales.days[1].sales === 90 && sales.chart.length === 14);
+    check('TOTAL: everything so far', sales.total.orders === 10 && sales.total.investment === 190 && sales.total.sales === 510 && sales.total.revenue === 320 && sales.total.since === YESTERDAY);
+    const salesJson = JSON.stringify(sales);
+    check('PRIVATE: the client never sees who wrote the numbers', !/Worker|submitted|by"|staff|employee/i.test(salesJson) && sales.username === 'ali.traders' && salesJson.includes('Listed 20 products'));
+    check('the client sees only its own numbers', (await CL2('GET', '/api/portal/sales')).data.total.orders === 0);
+    const stf = (await W2('GET', `/api/client-reports?clientId=${c1.data.id}&from=${YESTERDAY}&to=${TODAY}`)).data;
+    check('the team sees the entries with who wrote them (internal only)', stf.rows.length === 3 && stf.rows.some((r) => r.by === 'Worker One') && stf.totals.sales === 510);
+    check('a member edits only their own update; a leader or the admin any', (await W2('PUT', `/api/client-reports/${e1.data.id}`, { date: TODAY, orders: 9 })).status === 403 && (await W1('PUT', `/api/client-reports/${e1.data.id}`, { date: TODAY, market: 'Amazon US', orders: 6, investment: 100, sales: 360, note: 'Corrected' })).status === 200
+      && (await leaderA2('PUT', `/api/client-reports/${e2.data.id}`, { date: TODAY, orders: 4, investment: 50, sales: 120 })).status === 200 && (await CL('GET', '/api/portal/sales')).data.today.orders === 10);
+    check('delete follows the same rule', (await W1('DELETE', `/api/client-reports/${e2.data.id}`)).status === 403 && (await leaderA2('DELETE', `/api/client-reports/${e2.data.id}`)).status === 200 && (await CL('GET', '/api/portal/sales')).data.today.orders === 6);
+    const e3 = await bm('POST', '/api/client-reports', { clientId: c2.data.id, date: TODAY, orders: 7, sales: 70 });
+    check('a department-wide client gets updates from any team', e3.status === 200 && (await CL2('GET', '/api/portal/sales')).data.today.orders === 7);
+
+    console.log('Client chat (inquiry)');
+    const note = async (c, re) => (await c('GET', '/api/notifications?limit=100')).data.items.filter((n) => re.test(n.title));
+    const inq = await CL('POST', '/api/portal/chat', { channel: 'inquiry', body: 'Can you check my shipping settings?' });
+    check('the client writes an inquiry', inq.status === 200 && (await CL('POST', '/api/portal/chat', { channel: 'inquiry', body: '' })).status === 400 && (await CL('POST', '/api/portal/chat', { channel: 'secret', body: 'x' })).status === 400);
+    check('the team of that client (and the head and the admin) are notified, nobody else', (await note(W1, /New message from client ali.traders/)).length === 1 && (await note(leaderA2, /New message from client ali.traders/)).length === 1 && (await note(hodNew, /New message from client/)).length >= 1
+      && (await note(admin, /New message from client ali.traders/)).length === 1 && (await note(bm, /ali.traders/)).length === 0 && (await note(leaderB, /ali.traders/)).length === 0 && (await note(hod2, /ali.traders/)).length === 0);
+    check('notifications carry no message text', !JSON.stringify((await admin('GET', '/api/notifications?limit=100')).data).includes('shipping settings'));
+    const threadS = (await W2('GET', `/api/clients/${c1.data.id}/chat?channel=inquiry`)).data;
+    check('staff see the message and that it needs an answer', threadS.messages.length === 1 && threadS.messages[0].fromClient && threadS.needsReply);
+    check('the list flags the client as waiting', (await W2('GET', '/api/clients')).data.find((c) => c.id === c1.data.id).inquiryNeedsReply === true && (await W2('GET', '/api/client-alerts/summary')).data.inquiries === 1);
+    await W2('POST', `/api/clients/${c1.data.id}/chat`, { channel: 'inquiry', body: 'Sure, checking now.' });
+    const threadC = (await CL('GET', '/api/portal/chat?channel=inquiry')).data;
+    check('the client sees the reply from "eTricks", never a name', threadC.messages.length === 2 && threadC.messages[1].from === 'etricks' && !/Worker|Lina|Hamza/.test(JSON.stringify(threadC)));
+    check('the client sees that the message was read, the thread is no longer waiting', threadC.messages[0].seen === true && (await W1('GET', '/api/clients')).data.find((c) => c.id === c1.data.id).inquiryNeedsReply === false);
+    check('the client is notified of the reply without its text', (await note(CL, /New message from eTricks/)).length === 1 && !JSON.stringify((await CL('GET', '/api/notifications')).data).includes('checking now'));
+    check('internally everyone sees which colleague answered', (await W1('GET', `/api/clients/${c1.data.id}/chat?channel=inquiry`)).data.messages[1].author === 'Worker Two');
+    check('long polling: only new messages after an ID', (await CL('GET', `/api/portal/chat?channel=inquiry&after=${threadC.messages[1].id}`)).data.messages.length === 0);
+
+    console.log('Client alerts (urgent)');
+    const OTP = 'My OTP is 482913, quick';
+    await CL('POST', '/api/portal/chat', { channel: 'alert', body: OTP });
+    const urgent = (await note(W1, /ALERT from client ali.traders/))[0];
+    check('an alert raises an urgent notification for the whole team', urgent && urgent.body === 'Needs an immediate reply.' && (await note(leaderA2, /ALERT from client/)).length === 1 && (await note(admin, /ALERT from client/)).length === 1 && (await note(hodNew, /ALERT from client/)).length === 1 && (await note(bm, /ALERT/)).length === 0);
+    check('SECRET: the alert text is not in notifications, the activity log or lists', !JSON.stringify((await admin('GET', '/api/notifications?limit=100')).data).includes('482913') && !JSON.stringify((await W1('GET', '/api/notifications?limit=100')).data).includes('482913')
+      && !JSON.stringify((await admin('GET', '/api/logs?limit=500')).data).includes('482913') && !JSON.stringify((await W1('GET', '/api/clients')).data).includes('482913'));
+    const sum = (await W1('GET', '/api/client-alerts/summary')).data;
+    check('the pages polling for alerts see it at once, only for their own clients', sum.alerts === 1 && sum.items[0].username === 'ali.traders' && !!sum.items[0].since && (await bm('GET', '/api/client-alerts/summary')).data.alerts === 0 && (await hod2('GET', '/api/client-alerts/summary')).data.alerts === 0);
+    check('the answer clears the alert', (await W2('POST', `/api/clients/${c1.data.id}/chat`, { channel: 'alert', body: 'Received, thank you.' })).status === 200 && (await W1('GET', '/api/client-alerts/summary')).data.alerts === 0);
+    check('the client gets an urgent alert notification (no text) and it shows as unread', (await note(CL, /URGENT: eTricks needs your attention/)).length === 1 && !JSON.stringify((await CL('GET', '/api/notifications?limit=100')).data).includes('Received, thank you') && (await CL('GET', '/api/portal/summary')).data.alert === 1);
+    check('opening the alerts marks them read', (await CL('GET', '/api/portal/chat?channel=alert')).data.messages.length === 2 && (await CL('GET', '/api/portal/summary')).data.alert === 0);
+    await W1('POST', `/api/clients/${c1.data.id}/chat`, { channel: 'alert', body: 'Please send the OTP code now' });
+    check('the team can raise an alert to the client (e.g. to ask for a code)', (await CL('GET', '/api/portal/summary')).data.alert === 1 && (await CL('GET', '/api/portal/chat?channel=alert')).data.messages[2].from === 'etricks');
+    check('the two chats are separate', (await CL('GET', '/api/portal/chat?channel=inquiry')).data.messages.length === 2 && (await CL2('GET', '/api/portal/chat?channel=alert')).data.messages.length === 0 && (await CL2('GET', '/api/portal/chat?channel=inquiry')).data.messages.length === 0);
+    check('PRIVATE: another client never sees these chats', !JSON.stringify((await CL2('GET', '/api/portal/chat?channel=alert')).data).includes('482913'));
+    check('only the admin can wipe a chat', (await W1('DELETE', `/api/clients/${c1.data.id}/chat?channel=alert`)).status === 403 && (await hodNew('DELETE', `/api/clients/${c1.data.id}/chat?channel=alert`)).status === 403
+      && (await admin('DELETE', `/api/clients/${c1.data.id}/chat?channel=alert`)).data.removed === 3 && (await CL('GET', '/api/portal/chat?channel=alert')).data.messages.length === 0);
+
+    console.log('Client accounts');
+    check('the admin edits a client (name, contact, secret, team)', (await admin('PUT', `/api/clients/${c1.data.id}`, { displayName: 'Ali Traders Group', contact: '0301-1111111', secretInfo: 'New secret', teamId: tA })).status === 200 && (await admin('GET', `/api/clients/${c1.data.id}/secret`)).data.secretInfo === 'New secret');
+    check('moving the client to another team hides it from the old one', (await admin('PUT', `/api/clients/${c1.data.id}`, { teamId: tB })).status === 200 && await ids(W1) === c2.data.username && (await ids(bm)).includes('ali.traders'));
+    await admin('PUT', `/api/clients/${c1.data.id}`, { teamId: tA });
+    check('a new password signs the client out and the old one stops working', (await admin('PUT', `/api/clients/${c1.data.id}/password`, { password: 'BrandNew-Pass-9' })).status === 200 && (await CL('GET', '/api/portal/sales')).status === 401
+      && (await client()('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'ali.traders', password: cpw })).status === 401);
+    const CL3 = client();
+    check('the new password works', (await CL3('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'ali.traders', password: 'BrandNew-Pass-9' })).status === 200);
+    check('disabling a client ends its session and blocks sign-in; staff stop seeing it', (await admin('PUT', `/api/clients/${c1.data.id}`, { status: 'disabled' })).status === 200 && (await CL3('GET', '/api/portal/sales')).status === 401
+      && (await client()('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'ali.traders', password: 'BrandNew-Pass-9' })).status === 401 && await ids(W1) === c2.data.username);
+    await admin('PUT', `/api/clients/${c1.data.id}`, { status: 'active' });
+    check('a deleted employee leaves the client numbers in place', (await leaderA2('DELETE', `/api/employees/${w1.data.id}`)).status === 200 && (await admin('GET', `/api/client-reports?clientId=${c1.data.id}&from=${YESTERDAY}&to=${TODAY}`)).data.rows.length >= 2);
+    check('the admin deletes a client with everything of it', (await admin('DELETE', `/api/clients/${c3.data.id}`)).status === 200 && (await admin('GET', '/api/clients')).data.length === 2 && (await W2('DELETE', `/api/clients/${c2.data.id}`)).status === 403);
+    check('client activity is in the log without any message text', (await admin('GET', '/api/logs?limit=500')).data.some((l) => l.action === 'client_created') && (await admin('GET', '/api/logs?limit=500')).data.some((l) => l.action === 'client_alert'));
+    const cLock = await admin('POST', '/api/clients', { departmentId: ebayId, username: 'lock.test', password: cpw });
+    const guesser2 = client();
+    let lastC;
+    for (let i = 0; i < 7; i++) lastC = await guesser2('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'lock.test', password: 'guess-guess-' + i });
+    check('client sign-in is locked after repeated wrong passwords', lastC.status === 429 && (await client()('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'lock.test', password: cpw })).status === 429);
+    await admin('DELETE', `/api/clients/${cLock.data.id}`);
+
     console.log('Admin, logs, backups');
     const logs = (await admin('GET', '/api/logs')).data;
     check('activity log captured actions', logs.length > 10 && logs.some((l) => l.action === 'login') && logs.some((l) => l.action === 'login_failed') && logs.some((l) => l.action === 'transfer') && logs.some((l) => l.action === 'password_changed'));

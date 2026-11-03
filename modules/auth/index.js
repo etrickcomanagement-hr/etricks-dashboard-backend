@@ -13,7 +13,7 @@ const cookie = (token, maxAgeSec) =>
 function startSession(ctx, info) {
   const { token } = auth.createSession(info);
   ctx.res.setHeader('Set-Cookie', cookie(token, config.sessionHours * 3600));
-  ctx.user = { role: info.role, label: info.label, departmentId: info.departmentId ?? null, employeeId: info.employeeId ?? null };
+  ctx.user = { role: info.role, label: info.label, departmentId: info.departmentId ?? null, employeeId: info.employeeId ?? null, clientId: info.clientId ?? null };
 }
 
 // What the website needs to know about whoever is signed in (name, department, team).
@@ -21,6 +21,11 @@ function publicUser(u) {
   if (!u) return null;
   const out = { role: u.role, label: u.label, departmentId: u.departmentId, employeeId: u.employeeId, name: null, departmentName: null, teamId: null, teamName: null };
   if (u.role === 'admin') return out;
+  if (u.role === 'client') {
+    // a client sees only their own client ID and department: never a staff name
+    const c = db.get('SELECT c.username, d.name AS department_name FROM clients c JOIN departments d ON d.id=c.department_id WHERE c.id=?', u.clientId);
+    return { ...out, clientId: u.clientId, username: c?.username || null, departmentName: c?.departmentName || null };
+  }
   const e = db.get('SELECT e.name, e.team_id, d.name AS department_name FROM employees e JOIN departments d ON d.id=e.department_id WHERE e.id=?', u.employeeId);
   if (!e) return out;
   out.name = e.name;
@@ -38,6 +43,8 @@ function activeDepartment(id) {
   if (!dept) throw new HttpError(404, 'Department not found');
   return dept;
 }
+
+const DUMMY_HASH = auth.hashSecret('not-a-real-client-password');
 
 const LABELS = {
   hod: (name) => `${name} (Head of Department)`,
@@ -74,7 +81,9 @@ module.exports = {
       const out = { user: publicUser(ctx.user), companyName: settings.get('companyName') };
       if (ctx.user) {
         const s = settings.all();
-        out.settings = { companyName: s.companyName, currency: s.currency, weeklyOff: s.weeklyOff, leaveTypes: s.leaveTypes, expenseCategories: s.expenseCategories, scoreWeights: s.scoreWeights };
+        // a client gets only what their portal needs
+        out.settings = ctx.user.role === 'client' ? { companyName: s.companyName, currency: s.currency }
+          : { companyName: s.companyName, currency: s.currency, weeklyOff: s.weeklyOff, leaveTypes: s.leaveTypes, expenseCategories: s.expenseCategories, scoreWeights: s.scoreWeights };
         out.modules = require('../../core/modules').describe();
       }
       return out;
@@ -102,7 +111,7 @@ module.exports = {
     });
 
     m.post('/api/auth/login', (ctx) => {
-      const portal = oneOf(ctx.body.portal, 'Portal', ['admin', 'hod', 'leader', 'member'], { required: true });
+      const portal = oneOf(ctx.body.portal, 'Portal', ['admin', 'hod', 'leader', 'member', 'client'], { required: true });
       const password = String(ctx.body.password || '');
       if (!password) throw bad('Password is required');
       const deptId = portal === 'admin' ? 0 : int(ctx.body.departmentId, 'Department', { required: true });
@@ -124,6 +133,23 @@ module.exports = {
       }
 
       activeDepartment(deptId);
+
+      // Client of the company: the client ID the admin assigned + the password the admin set.
+      if (portal === 'client') {
+        const username = String(ctx.body.username || '').trim().slice(0, 40);
+        if (!username) throw bad('Client ID is required');
+        const ckey = `${key}|${username.toLowerCase()}`;
+        auth.throttle.check(ckey);
+        const c = db.get('SELECT * FROM clients WHERE username=? AND department_id=?', username, deptId);
+        // always do the same amount of work, so a wrong ID cannot be told apart from a wrong password
+        const ok = auth.verifySecret(password, c ? c.passwordHash : DUMMY_HASH) && !!c && c.status === 'active';
+        if (!ok) { auth.throttle.fail(ckey); denied('Incorrect client ID or password'); }
+        auth.throttle.ok(ckey); auth.throttle.ok(key);
+        db.update('clients', c.id, { lastLoginAt: new Date().toISOString() });
+        startSession(ctx, { role: 'client', departmentId: deptId, clientId: c.id, label: `Client ${c.username}` });
+        ctx.audit('login', 'portal', c.id, `Client portal (${c.username})`, deptId);
+        return { user: publicUser(ctx.user) };
+      }
 
       // Head of department / team leader: one password each; the password tells us who is signing in.
       if (portal === 'hod' || portal === 'leader') {
@@ -153,7 +179,7 @@ module.exports = {
       return { user: publicUser(ctx.user) };
     });
 
-    m.post('/api/auth/logout', { roles: ['admin', 'hod', 'leader', 'member'] }, (ctx) => {
+    m.post('/api/auth/logout', { roles: ['admin', 'hod', 'leader', 'member', 'client'] }, (ctx) => {
       ctx.audit('logout', 'portal', null, null);
       auth.destroySession(ctx.user.tokenHash);
       ctx.res.setHeader('Set-Cookie', cookie('', 0));

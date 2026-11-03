@@ -39,6 +39,8 @@ const CORE_MIGRATIONS = [
    UPDATE push_subscriptions SET recipient_role='employee' WHERE recipient_role='member';
    DELETE FROM push_subscriptions WHERE recipient_role='leader';
    DELETE FROM sessions;`,
+  // 5: clients have their own portal: a session can belong to a client
+  'ALTER TABLE sessions ADD COLUMN client_id INTEGER;',
 ];
 
 const loaded = [];

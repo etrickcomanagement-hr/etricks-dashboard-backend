@@ -15,15 +15,16 @@ module.exports = {
   order: 90,
 
   routes(m) {
-    const any = ['admin', 'hod', 'leader', 'member'];
+    const any = ['admin', 'hod', 'leader', 'member', 'client'];
     const lead = ['admin', 'hod']; // the activity log is for the admin and (for their department) the head
 
     m.get('/api/health', () => ({ ok: true }));
 
     m.get('/api/public/settings', () => ({ companyName: settings.get('companyName') }));
 
-    m.get('/api/settings', { roles: any }, () => {
+    m.get('/api/settings', { roles: any }, (ctx) => {
       const s = settings.all();
+      if (ctx.user.role === 'client') return { companyName: s.companyName, currency: s.currency };
       return { companyName: s.companyName, currency: s.currency, weeklyOff: s.weeklyOff, leaveTypes: s.leaveTypes, expenseCategories: s.expenseCategories, scoreWeights: s.scoreWeights };
     });
 
@@ -124,7 +125,7 @@ module.exports = {
     });
 
     m.post('/api/push/test', { roles: any }, (ctx) => {
-      const to = ctx.user.role === 'admin' ? { role: 'admin' } : { employeeId: ctx.user.employeeId };
+      const to = ctx.user.role === 'admin' ? { role: 'admin' } : ctx.user.role === 'client' ? { clientId: ctx.user.clientId } : { employeeId: ctx.user.employeeId };
       notify.send(to, { title: 'Test notification', body: 'Notifications are working on this device.', link: '#/dashboard', kind: 'test' });
       return { ok: true };
     });

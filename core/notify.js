@@ -4,14 +4,15 @@ const db = require('./db');
 /*
  * In-app notifications (and phone pop-ups through Web Push). Recipients:
  *   { employeeId }  one person: a member, a team leader or a head of department
+ *   { clientId }    a client of the company (client portal)
  *   { role: 'admin' }
  * send() never throws: a failed notification must not break the action that caused it.
  */
-const recipient = (to) => (to.role === 'admin' ? ['admin', 0] : ['employee', to.employeeId]);
-const forUser = (user) => recipient({ role: user.role, employeeId: user.employeeId });
+const recipient = (to) => (to.clientId != null ? ['client', to.clientId] : to.role === 'admin' ? ['admin', 0] : ['employee', to.employeeId]);
+const forUser = (user) => (user.role === 'client' ? ['client', user.clientId] : recipient({ role: user.role, employeeId: user.employeeId }));
 const key = (to) => recipient(to).join(':');
 
-function send(to, { title, body = null, link = null, kind = null }) {
+function send(to, { title, body = null, link = null, kind = null, urgent = false }) {
   try {
     const [role, id] = recipient(to);
     if (id == null) return;
@@ -21,7 +22,7 @@ function send(to, { title, body = null, link = null, kind = null }) {
       'INSERT INTO notifications(recipient_role, recipient_id, kind, title, body, link, created_at) VALUES (?,?,?,?,?,?,?)',
       role, id, kind, text, detail, link, new Date().toISOString());
     // Also pop up on the person's phone / computer (system notification), even if eTricks is closed.
-    require('./webpush').pushTo(role, id, { id: row.id, title: text, body: detail, link, kind });
+    require('./webpush').pushTo(role, id, { id: row.id, title: text, body: detail, link, kind, urgent: !!urgent });
   } catch (e) {
     console.error('[notify] failed', e.message);
   }

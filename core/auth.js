@@ -18,12 +18,12 @@ function verifySecret(secret, stored) {
 }
 const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
 
-function createSession({ role, departmentId = null, employeeId = null, label }) {
+function createSession({ role, departmentId = null, employeeId = null, clientId = null, label }) {
   const token = crypto.randomBytes(32).toString('base64url');
   const expires = new Date(Date.now() + config.sessionHours * 3600e3).toISOString();
   db.run(
-    'INSERT INTO sessions(token_hash, role, department_id, employee_id, label, created_at, expires_at) VALUES (?,?,?,?,?,?,?)',
-    sha(token), role, departmentId, employeeId, label, new Date().toISOString(), expires,
+    'INSERT INTO sessions(token_hash, role, department_id, employee_id, client_id, label, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?)',
+    sha(token), role, departmentId, employeeId, clientId, label, new Date().toISOString(), expires,
   );
   return { token, expires };
 }
@@ -45,7 +45,15 @@ function sessionFromToken(token) {
       return null;
     }
   }
-  return { role: s.role, departmentId: s.departmentId, employeeId: s.employeeId, label: s.label, tokenHash: s.tokenHash };
+  if (s.role === 'client') {
+    // a client account must still exist, be active and stay in the same department
+    const c = db.get('SELECT status, department_id FROM clients WHERE id=?', s.clientId);
+    if (!c || c.status !== 'active' || c.departmentId !== s.departmentId) {
+      db.run('DELETE FROM sessions WHERE token_hash=?', s.tokenHash);
+      return null;
+    }
+  }
+  return { role: s.role, departmentId: s.departmentId, employeeId: s.employeeId, clientId: s.clientId ?? null, label: s.label, tokenHash: s.tokenHash };
 }
 const destroySession = (tokenHash) => db.run('DELETE FROM sessions WHERE token_hash=?', tokenHash);
 const purgeSessions = () => db.run('DELETE FROM sessions WHERE expires_at < ?', new Date().toISOString());
