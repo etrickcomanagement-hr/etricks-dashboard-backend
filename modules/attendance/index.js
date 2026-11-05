@@ -46,19 +46,33 @@ function ownShift(employeeId) {
   return db.get('SELECT s.* FROM employees e JOIN shifts s ON s.id=e.shift_id WHERE e.id=?', employeeId);
 }
 
-// Latest record that is still open (night shifts check out after midnight).
+// Latest record that is still open (night shifts check out after midnight). A day that has been open for more than
+// MAX_OPEN_HOURS is a forgotten check-out: it is left as it is for the leader to correct and no longer hides today's "Check in".
+const MAX_OPEN_HOURS = 16;
 function openRecord(employeeId) {
-  return db.get(
+  const rec = db.get(
     'SELECT * FROM attendance WHERE employee_id=? AND check_in IS NOT NULL AND check_out IS NULL AND date>=? ORDER BY date DESC LIMIT 1',
     employeeId, addDays(today(), -1));
+  if (rec && Date.now() - new Date(rec.checkIn).getTime() > MAX_OPEN_HOURS * 3600e3) return null;
+  return rec;
 }
+const PRESENT_LIKE = ['present', 'late', 'half_day'];
 
 function myToday(employeeId) {
   const rec = openRecord(employeeId) || db.get('SELECT * FROM attendance WHERE employee_id=? AND date=?', employeeId, today());
   const [record] = rec ? decorate(db.all(`${SELECT} WHERE a.id=?`, rec.id)) : [null];
   let state = 'not_started';
-  if (record) state = record.checkOut ? 'done' : !record.checkIn ? 'done' : record.onBreak ? 'on_break' : 'working';
-  return { date: today(), state, record, shift: ownShift(employeeId) };
+  if (record) {
+    if (record.checkOut) state = 'done';
+    // marked present by a leader without times: the person can still check in to record the real time
+    else if (!record.checkIn) state = PRESENT_LIKE.includes(record.status) ? 'not_started' : 'done';
+    else state = record.onBreak ? 'on_break' : 'working';
+  }
+  // the last day (this week) that was left without a check-out, so the person is told
+  const forgot = db.get(
+    'SELECT date FROM attendance WHERE employee_id=? AND check_in IS NOT NULL AND check_out IS NULL AND date<? AND date>=? AND id<>? ORDER BY date DESC LIMIT 1',
+    employeeId, today(), addDays(today(), -7), record?.id ?? 0);
+  return { date: today(), state, record, shift: ownShift(employeeId), missedCheckOut: forgot?.date ?? null };
 }
 
 function loadForDecision(ctx, id) {
@@ -114,7 +128,17 @@ module.exports = {
 
       db.tx(() => {
         if (action === 'check_in') {
-          if (db.get('SELECT 1 AS x FROM attendance WHERE employee_id=? AND date=?', empId, today())) throw bad('Attendance for today is already recorded');
+          const existing = db.get('SELECT * FROM attendance WHERE employee_id=? AND date=?', empId, today());
+          if (existing) {
+            if (!existing.checkIn && !existing.checkOut && PRESENT_LIKE.includes(existing.status)) {
+              // a leader marked the day without times: the real check-in completes it (approval stays as the leader set it)
+              db.update('attendance', existing.id, { checkIn: nowIso, status: existing.status === 'present' ? lateStatus(ownShift(empId)) : existing.status });
+              return;
+            }
+            throw bad(existing.checkIn ? 'You have already checked in today' : `Today is already marked as ${existing.status.replace('_', ' ')} by your leader. Ask them to change it if that is not right`);
+          }
+          // an earlier day that was never closed gets a note for the leader
+          db.run("UPDATE attendance SET note=COALESCE(NULLIF(note,''), 'No check-out recorded') WHERE employee_id=? AND check_in IS NOT NULL AND check_out IS NULL AND date<?", empId, today());
           db.insert('attendance', {
             employeeId: empId, date: today(), checkIn: nowIso, status: lateStatus(ownShift(empId)), createdAt: nowIso,
             ...(ctx.user.role === 'member' ? {} : { approval: 'approved', decidedBy: AUTO, decidedAt: nowIso }),

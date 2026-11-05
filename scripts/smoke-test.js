@@ -669,7 +669,9 @@ async function main() {
     check('the client sees the reply from "eTricks", never a name', threadC.messages.length === 2 && threadC.messages[1].from === 'etricks' && !/Worker|Lina|Hamza/.test(JSON.stringify(threadC)));
     check('the client sees that the message was read, the thread is no longer waiting', threadC.messages[0].seen === true && (await W1('GET', '/api/clients')).data.find((c) => c.id === c1.data.id).inquiryNeedsReply === false);
     check('the client is notified of the reply without its text', (await note(CL, /New message from eTricks/)).length === 1 && !JSON.stringify((await CL('GET', '/api/notifications')).data).includes('checking now'));
-    check('internally everyone sees which colleague answered', (await W1('GET', `/api/clients/${c1.data.id}/chat?channel=inquiry`)).data.messages[1].author === 'Worker Two');
+    check('the admin sees which colleague answered', (await admin('GET', `/api/clients/${c1.data.id}/chat?channel=inquiry`)).data.messages[1].author === 'Worker Two');
+    const free = () => admin('PUT', `/api/clients/${c1.data.id}/chat-owner`, { employeeId: null }); // the first reply made Worker Two the owner: give it back for the whole-team checks below
+    await free();
     check('long polling: only new messages after an ID', (await CL('GET', `/api/portal/chat?channel=inquiry&after=${threadC.messages[1].id}`)).data.messages.length === 0);
 
     console.log('Client alerts (urgent)');
@@ -684,6 +686,7 @@ async function main() {
     check('the answer clears the alert', (await W2('POST', `/api/clients/${c1.data.id}/chat`, { channel: 'alert', body: 'Received, thank you.' })).status === 200 && (await W1('GET', '/api/client-alerts/summary')).data.alerts === 0);
     check('the client gets an urgent alert notification (no text) and it shows as unread', (await note(CL, /URGENT: eTricks needs your attention/)).length === 1 && !JSON.stringify((await CL('GET', '/api/notifications?limit=100')).data).includes('Received, thank you') && (await CL('GET', '/api/portal/summary')).data.alert === 1);
     check('opening the alerts marks them read', (await CL('GET', '/api/portal/chat?channel=alert')).data.messages.length === 2 && (await CL('GET', '/api/portal/summary')).data.alert === 0);
+    await free(); // Worker Two answered the alert, so it was theirs
     await W1('POST', `/api/clients/${c1.data.id}/chat`, { channel: 'alert', body: 'Please send the OTP code now' });
     check('the team can raise an alert to the client (e.g. to ask for a code)', (await CL('GET', '/api/portal/summary')).data.alert === 1 && (await CL('GET', '/api/portal/chat?channel=alert')).data.messages[2].from === 'etricks');
     check('the two chats are separate', (await CL('GET', '/api/portal/chat?channel=inquiry')).data.messages.length === 2 && (await CL2('GET', '/api/portal/chat?channel=alert')).data.messages.length === 0 && (await CL2('GET', '/api/portal/chat?channel=inquiry')).data.messages.length === 0);
@@ -723,6 +726,46 @@ async function main() {
     check('changing the people is written to the activity log', (await admin('GET', '/api/logs?limit=500')).data.some((l) => l.action === 'client_team_changed'));
     await admin('DELETE', `/api/clients/${c4.data.id}`);
 
+    console.log('Private chat: only the person who answers (and the admin) sees it');
+    const c5 = await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [la.data.id, w1.data.id, w2.data.id], username: 'private.test', password: cpw });
+    const CL5 = client();
+    await CL5('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'private.test', password: cpw });
+    const url5 = (ch = 'inquiry') => `/api/clients/${c5.data.id}/chat?channel=${ch}`;
+    const post5 = (c, body, ch = 'inquiry') => c('POST', `/api/clients/${c5.data.id}/chat`, { channel: ch, body });
+    const code5 = async (c) => (await c('GET', url5())).status;
+    const re5 = /client private.test/;
+    await CL5('POST', '/api/portal/chat', { channel: 'inquiry', body: 'Hello, are you there?' });
+    check('before anyone answers, every chosen person (and the head) can open the chat', await code5(W1) === 200 && await code5(W2) === 200 && await code5(leaderA2) === 200 && await code5(hodNew) === 200 && await code5(admin) === 200 && await code5(bm) === 404);
+    check('reading does not take the chat; the admin writing does not either', (await post5(admin, 'Admin here')).status === 200 && await code5(W1) === 200 && (await W1('GET', '/api/clients')).data.find((c) => c.id === c5.data.id).chat === 'open');
+    check('the first colleague who replies owns the conversation', (await post5(W2, 'Hi, how can I help?')).status === 200 && (await W2('GET', '/api/clients')).data.find((c) => c.id === c5.data.id).chat === 'mine');
+    check('PRIVATE: nobody else can read it: not a teammate, the leader or the head', await code5(W1) === 403 && await code5(leaderA2) === 403 && await code5(hodNew) === 403 && await code5(W2) === 200 && await code5(admin) === 200);
+    check('PRIVATE: nobody else can write into it', (await post5(W1, 'I will answer')).status === 403 && (await post5(leaderA2, 'I will answer')).status === 403 && (await post5(hodNew, 'I will answer')).status === 403);
+    const asW1 = (await W1('GET', '/api/clients')).data.find((c) => c.id === c5.data.id);
+    check('the others still see the client, but nothing of its chat', !!asW1 && asW1.chat === 'colleague' && asW1.inquiryNeedsReply === false && asW1.lastInquiryAt === null && !JSON.stringify(asW1).includes('Hello'));
+    const adminRow = (await admin('GET', '/api/clients')).data.find((c) => c.id === c5.data.id);
+    check('the admin sees who answers', adminRow.chat === 'colleague' && adminRow.chatOwnerName === 'Worker Two');
+    const n0 = { w1: (await note(W1, re5)).length, la: (await note(leaderA2, re5)).length, hod: (await note(hodNew, re5)).length, w2: (await note(W2, re5)).length, ad: (await note(admin, re5)).length };
+    await CL5('POST', '/api/portal/chat', { channel: 'inquiry', body: 'Second question' });
+    await CL5('POST', '/api/portal/chat', { channel: 'alert', body: 'Code 774411' });
+    check('the client\'s new messages and alerts notify only the owner and the admin', (await note(W2, re5)).length === n0.w2 + 2 && (await note(admin, re5)).length === n0.ad + 2
+      && (await note(W1, re5)).length === n0.w1 && (await note(leaderA2, re5)).length === n0.la && (await note(hodNew, re5)).length === n0.hod);
+    check('PRIVATE: the others get no alert banner, no waiting count and cannot open the alert chat', (await W1('GET', '/api/client-alerts/summary')).data.items.every((i) => i.username !== 'private.test') && (await W1('GET', '/api/client-alerts/summary')).data.inquiries === 0
+      && (await W2('GET', '/api/client-alerts/summary')).data.items.some((i) => i.username === 'private.test') && (await W1('GET', url5('alert'))).status === 403 && (await hodNew('GET', url5('alert'))).status === 403);
+    check('the client still sees one chat, written by "eTricks"', (await CL5('GET', '/api/portal/chat?channel=inquiry')).data.messages.length === 4 && !/Worker|Lina/.test(JSON.stringify((await CL5('GET', '/api/portal/chat?channel=inquiry')).data)));
+    check('only the owner or the admin can release it', (await W1('POST', `/api/clients/${c5.data.id}/chat/release`, {})).status === 403 && (await hodNew('POST', `/api/clients/${c5.data.id}/chat/release`, {})).status === 403
+      && (await W2('POST', `/api/clients/${c5.data.id}/chat/release`, {})).status === 200 && await code5(W1) === 200);
+    check('after the release the next person who replies owns it, and the first one is locked out', (await post5(W1, 'I take it')).status === 200 && await code5(W2) === 403 && await code5(W1) === 200);
+    check('only the admin hands it to someone, and only to a person of this client', (await W1('PUT', `/api/clients/${c5.data.id}/chat-owner`, { employeeId: w2.data.id })).status === 403
+      && (await admin('PUT', `/api/clients/${c5.data.id}/chat-owner`, { employeeId: bina.data.id })).status === 400
+      && (await admin('PUT', `/api/clients/${c5.data.id}/chat-owner`, { employeeId: w2.data.id })).status === 200 && await code5(W2) === 200 && await code5(W1) === 403 && (await note(W2, /You now answer client private.test/)).length === 1);
+    check('the head can take a chat too (and then the team cannot read it)', (await admin('PUT', `/api/clients/${c5.data.id}/chat-owner`, { employeeId: null })).status === 200 && (await post5(hodNew, 'Head here')).status === 200 && await code5(W2) === 403 && await code5(hodNew) === 200);
+    await admin('PUT', `/api/clients/${c5.data.id}/chat-owner`, { employeeId: null });
+    await post5(W2, 'Back to Worker Two');
+    check('an owner who is taken off the client no longer locks the chat', (await admin('PUT', `/api/clients/${c5.data.id}/staff`, { employeeIds: [la.data.id, w1.data.id] })).status === 200 && await code5(W1) === 200 && await code5(W2) === 404);
+    const acts = (await admin('GET', '/api/logs?limit=500')).data.map((l) => l.action);
+    check('the changes of who answers are in the activity log', ['client_chat_taken', 'client_chat_released', 'client_chat_assigned'].every((a) => acts.includes(a)));
+    await admin('DELETE', `/api/clients/${c5.data.id}`);
+
     console.log('Client accounts');
     check('the admin edits a client (name, contact, secret, team)', (await admin('PUT', `/api/clients/${c1.data.id}`, { displayName: 'Ali Traders Group', contact: '0301-1111111', secretInfo: 'New secret', teamId: tA })).status === 200 && (await admin('GET', `/api/clients/${c1.data.id}/secret`)).data.secretInfo === 'New secret');
     check('moving the client to another team hides it from the old team and nobody of the new team gets it by themselves', (await admin('PUT', `/api/clients/${c1.data.id}`, { teamId: tB })).status === 200 && await ids(W1) === c2.data.username && !(await ids(bm)).includes('ali.traders')
@@ -748,8 +791,32 @@ async function main() {
     check('client sign-in is locked after repeated wrong passwords', lastC.status === 429 && (await client()('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'lock.test', password: cpw })).status === 429);
     await admin('DELETE', `/api/clients/${cLock.data.id}`);
 
+    console.log('Attendance: nobody is ever left without a Check in button');
+    const pm = {};
+    for (const n of ['Punch One', 'Punch Two', 'Punch Three']) pm[n] = (await leaderA2('POST', '/api/employees', { name: n, joinDate: YESTERDAY })).data;
+    const login = async (m) => { const c = client(); await c('POST', '/api/auth/login', { portal: 'member', departmentId: ebayId, password: 'AlphaTeam-Pass1', employeeId: m.id, pin: m.pin }); return c; };
+    const P1 = await login(pm['Punch One']); const P2 = await login(pm['Punch Two']); const P3 = await login(pm['Punch Three']);
+    await leaderA2('POST', '/api/attendance/manual', { employeeId: pm['Punch One'].id, date: YESTERDAY, status: 'present', checkIn: '00:01' }); // yesterday: checked in, never checked out
+    const t1 = (await P1('GET', '/api/attendance/me/today')).data;
+    check('a forgotten check-out of yesterday does not hide today\'s Check in', t1.state === 'not_started' && t1.missedCheckOut === YESTERDAY);
+    check('the member can check in, take a break and check out today', (await P1('POST', '/api/attendance/me/action', { action: 'check_in' })).data.state === 'working' && (await P1('POST', '/api/attendance/me/action', { action: 'break_start' })).data.state === 'on_break'
+      && (await P1('POST', '/api/attendance/me/action', { action: 'break_end' })).data.state === 'working' && (await P1('POST', '/api/attendance/me/action', { action: 'check_out' })).data.state === 'done');
+    const yRow = (await leaderA2('GET', `/api/attendance?from=${YESTERDAY}&to=${YESTERDAY}&employeeId=${pm['Punch One'].id}`)).data[0];
+    check('yesterday stays open for the leader to correct, with a note', yRow.checkIn && !yRow.checkOut && /No check-out/.test(yRow.note));
+    await leaderA2('POST', '/api/attendance/manual', { employeeId: pm['Punch Two'].id, date: TODAY, status: 'present' }); // marked present by the leader, no times
+    const t2 = (await P2('GET', '/api/attendance/me/today')).data;
+    check('a day marked present by the leader (no times) still lets the member check in', t2.state === 'not_started' && t2.record.status === 'present');
+    const ci2 = await P2('POST', '/api/attendance/me/action', { action: 'check_in' });
+    check('the real check-in completes it and stays approved', ci2.status === 200 && ci2.data.state === 'working' && !!ci2.data.record.checkIn && ci2.data.record.approval === 'approved');
+    check('checking in twice is refused with a clear message', /already checked in/.test((await P2('POST', '/api/attendance/me/action', { action: 'check_in' })).data.error || ''));
+    await leaderA2('POST', '/api/attendance/manual', { employeeId: pm['Punch Three'].id, date: TODAY, status: 'absent' });
+    const t3 = (await P3('GET', '/api/attendance/me/today')).data;
+    const ci3 = await P3('POST', '/api/attendance/me/action', { action: 'check_in' });
+    check('a day marked absent is explained, not silently blocked', t3.state === 'done' && ci3.status === 400 && /marked as absent/.test(ci3.data.error || ''));
+    for (const n of Object.keys(pm)) await leaderA2('DELETE', `/api/employees/${pm[n].id}`);
+
     console.log('Admin, logs, backups');
-    const logs = (await admin('GET', '/api/logs')).data;
+    const logs = (await admin('GET', '/api/logs?limit=500')).data;
     check('activity log captured actions', logs.length > 10 && logs.some((l) => l.action === 'login') && logs.some((l) => l.action === 'login_failed') && logs.some((l) => l.action === 'transfer') && logs.some((l) => l.action === 'password_changed'));
     check('head sees only own department log; leaders have none', (await hodNew('GET', '/api/logs')).data.every((l) => l.departmentId === ebayId) && (await leaderA2('GET', '/api/logs')).status === 403);
     check('manual backup (pressed twice in a second is fine)', (await admin('POST', '/api/backups')).status === 200 && (await admin('POST', '/api/backups')).status === 200);

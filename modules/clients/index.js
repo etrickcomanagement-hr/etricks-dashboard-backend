@@ -16,6 +16,9 @@ const { HttpError, str, int, num, date, oneOf, bad, today, addDays, round } = re
  *   - The admin picks WHICH people work for a client (the team leader and members, chosen one by one). Only those people, the
  *     head of the department and the admin can see that client, its chat and its alerts. Nobody is added just because they are
  *     in the same team. Staff see only the client ID; the real name, contact and secret details are for the admin.
+ *   - A chat is private to the person who answers it. While nobody has answered, the chosen people (and the head) can read and
+ *     answer it; the first reply makes that person the owner, and from then on only the owner and the admin can read the
+ *     conversation or get its notifications. The owner or the admin can release it; the admin can hand it to someone else.
  */
 const STAFF = ['admin', 'hod', 'leader', 'member'];
 const CHANNELS = ['inquiry', 'alert'];
@@ -62,6 +65,31 @@ function shape(ctx, c) {
   return { ...base, displayName: c.displayName, contact: c.contact, departmentName: c.departmentName, teamName: c.teamName, hasSecret: !!c.secretInfo, lastLoginAt: c.lastLoginAt, createdAt: c.createdAt, staffCount: staffIds(c).length };
 }
 
+// The person who is answering this client's chat (null = nobody yet). An owner who left the client, the department or the
+// company no longer counts, so the chat is never locked behind someone who cannot open it.
+function chatOwner(c) {
+  if (!c.chatOwnerId) return null;
+  const e = db.get("SELECT id, name, role, department_id, status FROM employees WHERE id=?", c.chatOwnerId);
+  if (!e || e.status !== 'active' || e.departmentId !== c.departmentId) return null;
+  if (e.role === 'hod' || staffIds(c).includes(e.id)) return e;
+  return null;
+}
+// Admin: always. Everyone else: only while the chat has no owner, or when they are the owner.
+function canReadChat(ctx, c) {
+  if (ctx.user.role === 'admin') return true;
+  const o = chatOwner(c);
+  return !o || o.id === ctx.user.employeeId;
+}
+function chatGate(ctx, c) {
+  if (!canReadChat(ctx, c)) throw new HttpError(403, 'This conversation is private to the colleague who is answering this client');
+}
+// 'open' (nobody yet), 'mine' or 'colleague'; the admin also learns who.
+function chatInfo(ctx, c) {
+  const o = chatOwner(c);
+  const state = !o ? 'open' : o.id === ctx.user.employeeId ? 'mine' : 'colleague';
+  return ctx.user.role === 'admin' ? { chat: state, chatOwnerId: o?.id ?? null, chatOwnerName: o?.name ?? null } : { chat: state };
+}
+
 // The people chosen for a client who can still work on it (active, same department, same team when the client has one).
 const ASSIGNED_SQL = `SELECT e.id, e.name, e.role, e.team_id, t.name AS team_name FROM client_staff s
   JOIN employees e ON e.id=s.employee_id LEFT JOIN teams t ON t.id=e.team_id
@@ -73,6 +101,18 @@ const staffIds = (c) => staffRows(c).map((e) => e.id);
 function staffOf(c) {
   const heads = db.all("SELECT id FROM employees WHERE status='active' AND role='hod' AND department_id=?", c.departmentId).map((e) => e.id);
   return [...new Set([...staffIds(c), ...heads])].map((employeeId) => ({ employeeId })).concat([{ role: 'admin' }]);
+}
+
+// After the people of a client changed: an owner who no longer fits is dropped, so the chat opens up again.
+function tidyOwner(clientId) {
+  const c = db.get(`${CLIENT_SELECT} WHERE c.id=?`, clientId);
+  if (c && c.chatOwnerId && !chatOwner(c)) db.run('UPDATE clients SET chat_owner_id=NULL WHERE id=?', clientId);
+}
+
+// Who is told when the client writes: the owner of the chat and the admin, or (while nobody owns it) everyone who works with the client.
+function chatRecipients(c) {
+  const o = chatOwner(c);
+  return o ? [{ employeeId: o.id }, { role: 'admin' }] : staffOf(c);
 }
 
 // Who the admin can pick from: the leader and members of the team (or of the department when the client has no team).
@@ -96,6 +136,7 @@ function setStaff(c, employeeIds, ctx) {
   const removed = [...before].filter((id) => !wanted.includes(id));
   for (const id of added) notify.send({ employeeId: id }, { title: `You were added to client ${c.username}`, body: 'You can now see its updates and chat.', link: '#/client-updates', kind: 'chat' });
   for (const id of removed) notify.send({ employeeId: id }, { title: `You were removed from client ${c.username}`, body: 'You no longer have access to it.', kind: 'chat' });
+  tidyOwner(c.id);
   if (added.length || removed.length) ctx.audit('client_team_changed', 'client', c.id, `${c.username}: +${added.length} -${removed.length}, now ${wanted.length} people`, c.departmentId);
   return { added: added.length, removed: removed.length, total: wanted.length };
 }
@@ -156,6 +197,8 @@ module.exports = {
      INSERT INTO client_staff(client_id, employee_id, added_at)
        SELECT c.id, e.id, c.created_at FROM clients c JOIN employees e ON e.department_id=c.department_id
         WHERE e.status='active' AND e.role IN ('team_leader','member') AND (c.team_id IS NULL OR e.team_id=c.team_id);`,
+    // 3: the person who answers a client's chat owns the conversation
+    `ALTER TABLE clients ADD COLUMN chat_owner_id INTEGER REFERENCES employees(id) ON DELETE SET NULL;`,
   ],
 
   routes(m) {
@@ -169,12 +212,16 @@ module.exports = {
       const reports = ids.length ? db.all(`SELECT client_id, date, orders, investment, sales FROM client_reports WHERE client_id IN (${ids.map(() => '?').join(',')})`, ...ids) : [];
       const by = {};
       for (const r of reports) (by[r.clientId] ||= []).push(r);
-      return rows.map((c) => ({
-        ...shape(ctx, c),
-        today: sums((by[c.id] || []).filter((r) => r.date === day)), total: sums(by[c.id] || []),
-        inquiryNeedsReply: !!last[c.id]?.inquiry?.fromClient, alertNeedsReply: !!last[c.id]?.alert?.fromClient,
-        lastInquiryAt: last[c.id]?.inquiry?.at ?? null, lastAlertAt: last[c.id]?.alert?.at ?? null,
-      }));
+      return rows.map((c) => {
+        const info = chatInfo(ctx, c);
+        const hide = info.chat === 'colleague' && ctx.user.role !== 'admin'; // somebody else answers this client: no chat details
+        return {
+          ...shape(ctx, c), ...info,
+          today: sums((by[c.id] || []).filter((r) => r.date === day)), total: sums(by[c.id] || []),
+          inquiryNeedsReply: !hide && !!last[c.id]?.inquiry?.fromClient, alertNeedsReply: !hide && !!last[c.id]?.alert?.fromClient,
+          lastInquiryAt: hide ? null : last[c.id]?.inquiry?.at ?? null, lastAlertAt: hide ? null : last[c.id]?.alert?.at ?? null,
+        };
+      });
     });
 
     // The people the admin can choose from for a department / team (used by the "Select team members" list).
@@ -251,7 +298,7 @@ module.exports = {
           ...(b.secretInfo !== undefined ? { secretInfo: str(b.secretInfo, 'Account details', { max: 5000 }) } : {}), updatedAt: new Date().toISOString(),
         });
         if (b.staffIds !== undefined) setStaff({ ...c, username, departmentId, teamId }, b.staffIds, ctx);
-        else if (moved) db.run('DELETE FROM client_staff WHERE client_id=?', c.id); // another team: the old people no longer fit
+        else if (moved) { db.run('DELETE FROM client_staff WHERE client_id=?', c.id); tidyOwner(c.id); } // another team: the old people no longer fit
       });
       // a changed ID, department or status signs the client out
       if (status !== 'active' || departmentId !== c.departmentId || username !== c.username) db.run('DELETE FROM sessions WHERE client_id=?', c.id);
@@ -353,20 +400,27 @@ module.exports = {
     // =============================== staff: chat and alerts with a client ===============================
     m.get('/api/clients/:id/chat', { roles: STAFF }, (ctx) => {
       const c = staffClient(ctx, ctx.params.id);
+      chatGate(ctx, c);
       const channel = oneOf(ctx.query.channel, 'Channel', CHANNELS, { required: true });
       const after = Number(ctx.query.after) || 0;
       const rows = db.all('SELECT * FROM client_messages WHERE client_id=? AND channel=? AND id>? ORDER BY id DESC LIMIT 300', c.id, channel, after).reverse();
       // the client sees that their messages were read (by "eTricks": not by whom)
       db.run('UPDATE client_messages SET read_at=? WHERE client_id=? AND channel=? AND from_client=1 AND read_at IS NULL', new Date().toISOString(), c.id, channel);
       const last = db.get('SELECT from_client FROM client_messages WHERE client_id=? AND channel=? ORDER BY id DESC LIMIT 1', c.id, channel);
-      return { client: { id: c.id, username: c.username }, messages: rows.map(toStaffMessage), needsReply: !!last?.fromClient };
+      return { client: { id: c.id, username: c.username }, messages: rows.map(toStaffMessage), needsReply: !!last?.fromClient, ...chatInfo(ctx, c) };
     });
 
     m.post('/api/clients/:id/chat', { roles: STAFF }, (ctx) => {
       const c = staffClient(ctx, ctx.params.id);
+      chatGate(ctx, c);
       if (c.status !== 'active') throw bad('This client is disabled');
       const channel = oneOf(ctx.body.channel, 'Channel', CHANNELS, { required: true });
       const body = str(ctx.body.body, 'Message', { required: true, max: 2000 });
+      // the first person to answer becomes the owner of the conversation (the admin only steps in, so does not take it)
+      if (ctx.user.role !== 'admin' && !chatOwner(c)) {
+        db.run('UPDATE clients SET chat_owner_id=? WHERE id=?', ctx.user.employeeId, c.id);
+        ctx.audit('client_chat_taken', 'client', c.id, c.username, c.departmentId);
+      }
       const label = ctx.user.role === 'admin' ? 'Administrator' : db.get('SELECT name, role FROM employees WHERE id=?', ctx.user.employeeId);
       const who = typeof label === 'string' ? label : label.name;
       const r = db.insert('client_messages', { clientId: c.id, channel, fromClient: 0, staffId: ctx.user.employeeId ?? null, staffLabel: who, body, createdAt: new Date().toISOString() });
@@ -376,6 +430,31 @@ module.exports = {
         ? { title: 'URGENT: eTricks needs your attention now', body: 'Open the Alerts section of your portal.', link: '#/portal-alerts', kind: 'alert', urgent: true }
         : { title: 'New message from eTricks', link: '#/portal-chat', kind: 'chat' });
       return { id: r.id };
+    });
+
+    // The owner (or the admin) gives the conversation back: the chosen people can answer it again.
+    m.post('/api/clients/:id/chat/release', { roles: STAFF }, (ctx) => {
+      const c = staffClient(ctx, ctx.params.id);
+      const o = chatOwner(c);
+      if (!o) return { ok: true };
+      if (ctx.user.role !== 'admin' && o.id !== ctx.user.employeeId) throw new HttpError(403, 'This conversation is private to the colleague who is answering this client');
+      db.run('UPDATE clients SET chat_owner_id=NULL WHERE id=?', c.id);
+      ctx.audit('client_chat_released', 'client', c.id, c.username, c.departmentId);
+      return { ok: true };
+    });
+
+    // Admin: hand the conversation to a chosen person (or to nobody).
+    m.put('/api/clients/:id/chat-owner', { roles: ['admin'] }, (ctx) => {
+      const c = staffClient(ctx, ctx.params.id);
+      const id = ctx.body.employeeId == null || ctx.body.employeeId === '' ? null : int(ctx.body.employeeId, 'Person', { required: true });
+      if (id != null) {
+        const ok = staffIds(c).includes(id) || db.get("SELECT 1 AS x FROM employees WHERE id=? AND role='hod' AND status='active' AND department_id=?", id, c.departmentId);
+        if (!ok) throw bad('That person does not work for this client. Add them under Members first');
+      }
+      db.run('UPDATE clients SET chat_owner_id=? WHERE id=?', id, c.id);
+      ctx.audit(id ? 'client_chat_assigned' : 'client_chat_released', 'client', c.id, c.username, c.departmentId);
+      if (id) notify.send({ employeeId: id }, { title: `You now answer client ${c.username}`, body: 'The conversation is private to you.', link: '#/client-chat', kind: 'chat' });
+      return { ok: true };
     });
 
     // Admin only: wipe a chat (for example after an OTP was shared).
@@ -389,7 +468,7 @@ module.exports = {
 
     // The page polls this every few seconds: how many clients are waiting for an answer, and since when.
     m.get('/api/client-alerts/summary', { roles: STAFF }, (ctx) => {
-      const clients = db.all(`${CLIENT_SELECT} WHERE c.status='active'`).filter((c) => inScope(ctx, c));
+      const clients = db.all(`${CLIENT_SELECT} WHERE c.status='active'`).filter((c) => inScope(ctx, c) && canReadChat(ctx, c)); // not the chats a colleague answers
       if (!clients.length) return { alerts: 0, inquiries: 0, items: [] };
       const last = lastMessages(clients.map((c) => c.id));
       const items = [];
@@ -461,7 +540,7 @@ module.exports = {
       const payload = channel === 'alert'
         ? { title: `ALERT from client ${c.username}`, body: 'Needs an immediate reply.', link: '#/client-alerts', kind: 'alert', urgent: true }
         : { title: `New message from client ${c.username}`, link: '#/client-chat', kind: 'chat' };
-      for (const to of staffOf(c)) notify.send(to, payload);
+      for (const to of chatRecipients(c)) notify.send(to, payload);
       return { id: r.id };
     });
   },

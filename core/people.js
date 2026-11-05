@@ -40,6 +40,7 @@ function purge(employeeId) {
     db.run('UPDATE client_reports SET submitted_by=NULL WHERE submitted_by=?', id);
     db.run('UPDATE client_messages SET staff_id=NULL WHERE staff_id=?', id);
     db.run('DELETE FROM client_staff WHERE employee_id=?', id);
+    db.run('UPDATE clients SET chat_owner_id=NULL WHERE chat_owner_id=?', id);
     db.run("UPDATE issues SET recipient_role='admin', recipient_id=NULL WHERE recipient_id=?", id);
     db.run('UPDATE tasks SET assigned_by_id=NULL WHERE assigned_by_id=?', id);
     db.run('UPDATE complaints SET filed_by_employee_id=NULL WHERE filed_by_employee_id=?', id);
