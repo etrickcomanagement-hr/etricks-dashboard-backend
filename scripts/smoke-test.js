@@ -602,10 +602,10 @@ async function main() {
     check('only the admin creates clients', (await hodNew('POST', '/api/clients', { departmentId: ebayId, password: cpw })).status === 403 && (await leaderA2('POST', '/api/clients', { departmentId: ebayId, password: cpw })).status === 403 && (await W1('POST', '/api/clients', { departmentId: ebayId, password: cpw })).status === 403);
     check('client ID and password are validated', (await admin('POST', '/api/clients', { departmentId: ebayId, username: 'a b', password: cpw })).status === 400 && (await admin('POST', '/api/clients', { departmentId: ebayId, username: 'okname', password: 'short' })).status === 400
       && (await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tZ, username: 'okname', password: cpw })).status === 400 && (await admin('POST', '/api/clients', { password: cpw })).status === 400);
-    const c1 = await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, username: 'ali.traders', password: cpw, displayName: 'Ali Traders Ltd', contact: '0300-9999999', secretInfo: 'Store login: seller@example.com / TopSecret!77' });
+    const c1 = await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [la.data.id, w1.data.id, w2.data.id], username: 'ali.traders', password: cpw, displayName: 'Ali Traders Ltd', contact: '0300-9999999', secretInfo: 'Store login: seller@example.com / TopSecret!77' });
     check('admin creates a client for a team', c1.status === 200 && c1.data.username === 'ali.traders');
     check('the client ID is unique (any letter case)', (await admin('POST', '/api/clients', { departmentId: ebayId, username: 'ALI.TRADERS', password: cpw })).status === 400);
-    const c2 = await admin('POST', '/api/clients', { departmentId: ebayId, password: cpw, displayName: 'Second Client' });
+    const c2 = await admin('POST', '/api/clients', { departmentId: ebayId, staffIds: [la.data.id, w1.data.id, bina.data.id, lb.data.id], password: cpw, displayName: 'Second Client' });
     check('the admin can let the system pick the ID', c2.status === 200 && /^CL-\d{4}$/.test(c2.data.username));
     const c3 = await admin('POST', '/api/clients', { departmentId: amazonId, username: 'amazon.client', password: cpw });
     const ids = async (c) => (await c('GET', '/api/clients')).data.map((x) => x.username).sort().join();
@@ -691,10 +691,43 @@ async function main() {
     check('only the admin can wipe a chat', (await W1('DELETE', `/api/clients/${c1.data.id}/chat?channel=alert`)).status === 403 && (await hodNew('DELETE', `/api/clients/${c1.data.id}/chat?channel=alert`)).status === 403
       && (await admin('DELETE', `/api/clients/${c1.data.id}/chat?channel=alert`)).data.removed === 3 && (await CL('GET', '/api/portal/chat?channel=alert')).data.messages.length === 0);
 
+    console.log('Select team members for a client');
+    const cand = await admin('GET', `/api/clients/candidates?departmentId=${ebayId}&teamId=${tA}`);
+    const candNames = (cand.data || []).map((e) => e.name);
+    check('the list for a team has the leader and the members of that team only', cand.status === 200 && candNames.includes('Lina Lead') && candNames.includes('Worker One') && candNames.includes('Worker Two')
+      && !candNames.includes('Bina Khan') && !candNames.includes('Bilal Lead') && cand.data[0].role === 'Team leader');
+    check('without a team the list has the whole department; a team of another department is refused', (await admin('GET', `/api/clients/candidates?departmentId=${ebayId}`)).data.length > cand.data.length
+      && (await admin('GET', `/api/clients/candidates?departmentId=${ebayId}&teamId=${tZ}`)).status === 400);
+    check('only the admin can open that list or change the people of a client', (await hodNew('GET', `/api/clients/candidates?departmentId=${ebayId}`)).status === 403 && (await leaderA2('PUT', `/api/clients/${c1.data.id}/staff`, { employeeIds: [] })).status === 403
+      && (await W2('GET', `/api/clients/${c1.data.id}/staff`)).status === 403);
+    check('people of another team cannot be chosen for a team client', (await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [bina.data.id], username: 'pick.bad', password: cpw })).status === 400
+      && (await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: ['x'], username: 'pick.bad', password: cpw })).status === 400
+      && (await admin('GET', '/api/clients')).data.every((c) => c.username !== 'pick.bad'));
+    const c4 = await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [w2.data.id], username: 'select.test', password: cpw });
+    check('a client can be created with only the chosen people', c4.status === 200 && (await admin('GET', '/api/clients')).data.find((c) => c.id === c4.data.id).staffCount === 1);
+    const see = async (c) => (await c('GET', `/api/clients/${c4.data.id}/chat?channel=inquiry`)).status;
+    check('only the chosen member, the head and the admin can open it; the rest of the team cannot', await see(W2) === 200 && await see(hodNew) === 200 && await see(admin) === 200 && await see(leaderA2) === 404 && await see(W1) === 404 && await see(bm) === 404);
+    check('the rest of the team does not see it in lists, updates or alerts', !(await ids(W1)).includes('select.test') && !(await ids(leaderA2)).includes('select.test') && (await ids(W2)).includes('select.test')
+      && (await W1('POST', '/api/client-reports', { clientId: c4.data.id, date: TODAY, orders: 1 })).status === 404 && (await W2('POST', '/api/client-reports', { clientId: c4.data.id, date: TODAY, orders: 2, sales: 20 })).status === 200
+      && (await W1('GET', `/api/client-reports?clientId=${c4.data.id}`)).data.rows.length === 0);
+    const CL4 = client();
+    await CL4('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'select.test', password: cpw });
+    await CL4('POST', '/api/portal/chat', { channel: 'alert', body: 'Code 998877' });
+    check('only the chosen people are notified when the client writes', (await note(W2, /ALERT from client select.test/)).length === 1 && (await note(hodNew, /ALERT from client select.test/)).length === 1 && (await note(admin, /ALERT from client select.test/)).length === 1
+      && (await note(W1, /select.test/)).length === 0 && (await note(leaderA2, /select.test/)).length === 0 && (await W1('GET', '/api/client-alerts/summary')).data.items.every((i) => i.username !== 'select.test'));
+    check('the admin adds the team leader later and the leader is told', (await admin('PUT', `/api/clients/${c4.data.id}/staff`, { employeeIds: [w2.data.id, la.data.id] })).data.added === 1 && await see(leaderA2) === 200 && (await note(leaderA2, /You were added to client select.test/)).length === 1
+      && (await leaderA2('GET', '/api/client-alerts/summary')).data.items.some((i) => i.username === 'select.test'));
+    check('the admin removes a member later: access ends at once and they are told', (await admin('PUT', `/api/clients/${c4.data.id}/staff`, { employeeIds: [la.data.id] })).data.removed === 1 && await see(W2) === 404 && (await note(W2, /You were removed from client select.test/)).length === 1 && !(await ids(W2)).includes('select.test'));
+    check('the admin sees who is chosen', (await admin('GET', `/api/clients/${c4.data.id}/staff`)).data.candidates.filter((e) => e.chosen).map((e) => e.name).join() === 'Lina Lead');
+    check('with nobody chosen only the head and the admin see the client', (await admin('PUT', `/api/clients/${c4.data.id}/staff`, { employeeIds: [] })).data.total === 0 && await see(leaderA2) === 404 && await see(hodNew) === 200 && (await admin('PUT', `/api/clients/${c4.data.id}/staff`, { employeeIds: [bina.data.id] })).status === 400);
+    check('changing the people is written to the activity log', (await admin('GET', '/api/logs?limit=500')).data.some((l) => l.action === 'client_team_changed'));
+    await admin('DELETE', `/api/clients/${c4.data.id}`);
+
     console.log('Client accounts');
     check('the admin edits a client (name, contact, secret, team)', (await admin('PUT', `/api/clients/${c1.data.id}`, { displayName: 'Ali Traders Group', contact: '0301-1111111', secretInfo: 'New secret', teamId: tA })).status === 200 && (await admin('GET', `/api/clients/${c1.data.id}/secret`)).data.secretInfo === 'New secret');
-    check('moving the client to another team hides it from the old one', (await admin('PUT', `/api/clients/${c1.data.id}`, { teamId: tB })).status === 200 && await ids(W1) === c2.data.username && (await ids(bm)).includes('ali.traders'));
-    await admin('PUT', `/api/clients/${c1.data.id}`, { teamId: tA });
+    check('moving the client to another team hides it from the old team and nobody of the new team gets it by themselves', (await admin('PUT', `/api/clients/${c1.data.id}`, { teamId: tB })).status === 200 && await ids(W1) === c2.data.username && !(await ids(bm)).includes('ali.traders')
+      && (await admin('GET', `/api/clients/${c1.data.id}/staff`)).data.candidates.every((e) => !e.chosen));
+    await admin('PUT', `/api/clients/${c1.data.id}`, { teamId: tA, staffIds: [la.data.id, w1.data.id, w2.data.id] });
     check('a new password signs the client out and the old one stops working', (await admin('PUT', `/api/clients/${c1.data.id}/password`, { password: 'BrandNew-Pass-9' })).status === 200 && (await CL('GET', '/api/portal/sales')).status === 401
       && (await client()('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'ali.traders', password: cpw })).status === 401);
     const CL3 = client();

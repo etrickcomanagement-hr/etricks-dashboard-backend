@@ -13,8 +13,9 @@ const { HttpError, str, int, num, date, oneOf, bad, today, addDays, round } = re
  *     and the notes, labelled "eTricks": never the name of the person who wrote them.
  *   - Two chats per client: "inquiry" (ordinary messages) and "alert" (urgent: an OTP, a confidential detail, ...). Alerts
  *     raise a loud notification on the other side and are never put into notification texts.
- *   - Staff see only the clients of their department (and team, when the client is assigned to one) and only the client ID.
- *     The real name, contact and secret details are for the admin.
+ *   - The admin picks WHICH people work for a client (the team leader and members, chosen one by one). Only those people, the
+ *     head of the department and the admin can see that client, its chat and its alerts. Nobody is added just because they are
+ *     in the same team. Staff see only the client ID; the real name, contact and secret details are for the admin.
  */
 const STAFF = ['admin', 'hod', 'leader', 'member'];
 const CHANNELS = ['inquiry', 'alert'];
@@ -33,11 +34,16 @@ function myTeam(ctx) {
   if (ctx.user.role === 'member') return db.get('SELECT team_id FROM employees WHERE id=?', ctx.user.employeeId)?.teamId ?? -1;
   return null;
 }
+// The clients this leader / member was chosen for (read once per request).
+function assignedTo(ctx) {
+  return (ctx.assignedClients ||= new Set(db.all('SELECT client_id FROM client_staff WHERE employee_id=?', ctx.user.employeeId).map((r) => r.clientId)));
+}
 function inScope(ctx, c) {
   if (ctx.user.role === 'admin') return true;
   if (c.departmentId !== ctx.user.departmentId) return false;
   if (ctx.user.role === 'hod') return true;
-  return c.teamId == null || c.teamId === myTeam(ctx);
+  // chosen for this client, and still in the client's team (a person who moved to another team loses the client)
+  return assignedTo(ctx).has(c.id) && (c.teamId == null || c.teamId === myTeam(ctx));
 }
 function staffClient(ctx, id) {
   const c = db.get(`${CLIENT_SELECT} WHERE c.id=?`, int(id, 'Client', { required: true }));
@@ -53,14 +59,45 @@ const CLIENT_SELECT = `
 function shape(ctx, c) {
   const base = { id: c.id, username: c.username, departmentId: c.departmentId, teamId: c.teamId, status: c.status };
   if (ctx.user.role !== 'admin') return base;
-  return { ...base, displayName: c.displayName, contact: c.contact, departmentName: c.departmentName, teamName: c.teamName, hasSecret: !!c.secretInfo, lastLoginAt: c.lastLoginAt, createdAt: c.createdAt };
+  return { ...base, displayName: c.displayName, contact: c.contact, departmentName: c.departmentName, teamName: c.teamName, hasSecret: !!c.secretInfo, lastLoginAt: c.lastLoginAt, createdAt: c.createdAt, staffCount: staffIds(c).length };
 }
 
-// Everyone who works with a client: the head, the people of the assigned team (or of the whole department) and the admin.
+// The people chosen for a client who can still work on it (active, same department, same team when the client has one).
+const ASSIGNED_SQL = `SELECT e.id, e.name, e.role, e.team_id, t.name AS team_name FROM client_staff s
+  JOIN employees e ON e.id=s.employee_id LEFT JOIN teams t ON t.id=e.team_id
+  WHERE s.client_id=? AND e.status='active' AND e.department_id=? AND (? IS NULL OR e.team_id=?) ORDER BY e.role DESC, e.name`;
+const staffRows = (c) => db.all(ASSIGNED_SQL, c.id, c.departmentId, c.teamId ?? null, c.teamId ?? null);
+const staffIds = (c) => staffRows(c).map((e) => e.id);
+
+// Everyone who works with a client: the chosen people, the head of the department and the admin.
 function staffOf(c) {
-  const ids = db.all(
-    "SELECT id FROM employees WHERE status='active' AND department_id=? AND (role='hod' OR ? IS NULL OR team_id=?)", c.departmentId, c.teamId ?? null, c.teamId ?? null).map((e) => e.id);
-  return [...ids.map((employeeId) => ({ employeeId })), { role: 'admin' }];
+  const heads = db.all("SELECT id FROM employees WHERE status='active' AND role='hod' AND department_id=?", c.departmentId).map((e) => e.id);
+  return [...new Set([...staffIds(c), ...heads])].map((employeeId) => ({ employeeId })).concat([{ role: 'admin' }]);
+}
+
+// Who the admin can pick from: the leader and members of the team (or of the department when the client has no team).
+function candidates(departmentId, teamId) {
+  return db.all(
+    `SELECT e.id, e.name, e.emp_code, e.role, e.team_id, t.name AS team_name FROM employees e LEFT JOIN teams t ON t.id=e.team_id
+      WHERE e.status='active' AND e.department_id=? AND e.role IN ('team_leader','member') AND (? IS NULL OR e.team_id=?)
+      ORDER BY (e.role='team_leader') DESC, t.name, e.name`, departmentId, teamId ?? null, teamId ?? null)
+    .map((e) => ({ id: e.id, name: e.name, empCode: e.empCode, role: e.role === 'team_leader' ? 'Team leader' : 'Member', teamName: e.teamName }));
+}
+
+// Replace the chosen people of a client. Only people from the right department/team are accepted. Call inside db.tx.
+function setStaff(c, employeeIds, ctx) {
+  const wanted = [...new Set((Array.isArray(employeeIds) ? employeeIds : []).map((x) => int(x, 'Person', { required: true })))];
+  const ok = new Set(candidates(c.departmentId, c.teamId).map((e) => e.id));
+  if (wanted.some((id) => !ok.has(id))) throw bad('Some of the chosen people do not belong to that team');
+  const before = new Set(db.all('SELECT employee_id FROM client_staff WHERE client_id=?', c.id).map((r) => r.employeeId));
+  db.run('DELETE FROM client_staff WHERE client_id=?', c.id);
+  for (const id of wanted) db.run('INSERT INTO client_staff(client_id, employee_id, added_at) VALUES (?,?,?)', c.id, id, new Date().toISOString());
+  const added = wanted.filter((id) => !before.has(id));
+  const removed = [...before].filter((id) => !wanted.includes(id));
+  for (const id of added) notify.send({ employeeId: id }, { title: `You were added to client ${c.username}`, body: 'You can now see its updates and chat.', link: '#/client-updates', kind: 'chat' });
+  for (const id of removed) notify.send({ employeeId: id }, { title: `You were removed from client ${c.username}`, body: 'You no longer have access to it.', kind: 'chat' });
+  if (added.length || removed.length) ctx.audit('client_team_changed', 'client', c.id, `${c.username}: +${added.length} -${removed.length}, now ${wanted.length} people`, c.departmentId);
+  return { added: added.length, removed: removed.length, total: wanted.length };
 }
 
 // Last message of each chat, to know who has to answer.
@@ -110,6 +147,15 @@ module.exports = {
        id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE, channel TEXT NOT NULL,
        from_client INTEGER NOT NULL, staff_id INTEGER, staff_label TEXT, body TEXT NOT NULL, created_at TEXT NOT NULL, read_at TEXT);
      CREATE INDEX idx_clientmsg ON client_messages(client_id, channel, id);`,
+    // 2: the admin chooses which leader / members work for each client. Until now a whole team did, so every existing client keeps
+    // exactly the people it had (the admin can then remove the ones who should not see it).
+    `CREATE TABLE client_staff (
+       client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE, employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+       added_at TEXT NOT NULL, PRIMARY KEY (client_id, employee_id));
+     CREATE INDEX idx_clientstaff_emp ON client_staff(employee_id);
+     INSERT INTO client_staff(client_id, employee_id, added_at)
+       SELECT c.id, e.id, c.created_at FROM clients c JOIN employees e ON e.department_id=c.department_id
+        WHERE e.status='active' AND e.role IN ('team_leader','member') AND (c.team_id IS NULL OR e.team_id=c.team_id);`,
   ],
 
   routes(m) {
@@ -131,6 +177,14 @@ module.exports = {
       }));
     });
 
+    // The people the admin can choose from for a department / team (used by the "Select team members" list).
+    m.get('/api/clients/candidates', { roles: ['admin'] }, (ctx) => {
+      const departmentId = int(ctx.query.departmentId, 'Department', { required: true });
+      const teamId = int(ctx.query.teamId, 'Team');
+      checkTeam(departmentId, teamId);
+      return candidates(departmentId, teamId);
+    });
+
     m.post('/api/clients', { roles: ['admin'] }, (ctx) => {
       const b = ctx.body;
       const departmentId = int(b.departmentId, 'Department', { required: true });
@@ -142,9 +196,16 @@ module.exports = {
       if (db.get('SELECT 1 AS x FROM clients WHERE username=?', username)) throw bad('That client ID is already used');
       const password = accounts.validatePassword(b.password, 'Client password');
       const now = new Date().toISOString();
-      const r = db.insert('clients', {
-        username, departmentId, teamId, displayName: str(b.displayName, 'Name', { max: 100 }), contact: str(b.contact, 'Contact', { max: 200 }),
-        secretInfo: str(b.secretInfo, 'Account details', { max: 5000 }), passwordHash: auth.hashSecret(password), status: 'active', createdAt: now, updatedAt: now,
+      const wanted = Array.isArray(b.staffIds) ? b.staffIds : [];
+      const ok = new Set(candidates(departmentId, teamId).map((e) => e.id));
+      if (wanted.some((id) => !ok.has(Number(id)))) throw bad('Some of the chosen people do not belong to that team');
+      const r = db.tx(() => {
+        const row = db.insert('clients', {
+          username, departmentId, teamId, displayName: str(b.displayName, 'Name', { max: 100 }), contact: str(b.contact, 'Contact', { max: 200 }),
+          secretInfo: str(b.secretInfo, 'Account details', { max: 5000 }), passwordHash: auth.hashSecret(password), status: 'active', createdAt: now, updatedAt: now,
+        });
+        setStaff({ id: row.id, username, departmentId, teamId }, wanted, ctx);
+        return row;
       });
       ctx.audit('client_created', 'client', r.id, username, departmentId);
       return { id: r.id, username };
@@ -153,6 +214,19 @@ module.exports = {
     m.get('/api/clients/:id', { roles: ['admin'] }, (ctx) => {
       const c = staffClient(ctx, ctx.params.id);
       return shape(ctx, c);
+    });
+
+    // Who works for this client (admin): the chosen people, and who else could be added.
+    m.get('/api/clients/:id/staff', { roles: ['admin'] }, (ctx) => {
+      const c = staffClient(ctx, ctx.params.id);
+      const chosen = new Set(staffIds(c));
+      return { candidates: candidates(c.departmentId, c.teamId).map((e) => ({ ...e, chosen: chosen.has(e.id) })) };
+    });
+
+    // Add or remove people later: send the full list of people who should be in the client's chat.
+    m.put('/api/clients/:id/staff', { roles: ['admin'] }, (ctx) => {
+      const c = staffClient(ctx, ctx.params.id);
+      return db.tx(() => setStaff(c, ctx.body.employeeIds, ctx));
     });
 
     m.put('/api/clients/:id', { roles: ['admin'] }, (ctx) => {
@@ -166,9 +240,18 @@ module.exports = {
       if (!USERNAME.test(username)) throw bad('Client ID must be 3-30 characters: letters, numbers, dot, dash or underscore');
       if (db.get('SELECT 1 AS x FROM clients WHERE username=? AND id<>?', username, c.id)) throw bad('That client ID is already used');
       const status = oneOf(b.status, 'Status', ['active', 'disabled'], { def: c.status });
-      db.update('clients', c.id, {
-        username, departmentId, teamId, status, displayName: str(b.displayName, 'Name', { max: 100 }), contact: str(b.contact, 'Contact', { max: 200 }),
-        ...(b.secretInfo !== undefined ? { secretInfo: str(b.secretInfo, 'Account details', { max: 5000 }) } : {}), updatedAt: new Date().toISOString(),
+      const moved = departmentId !== c.departmentId || (teamId ?? null) !== (c.teamId ?? null);
+      if (b.staffIds !== undefined) {
+        const ok = new Set(candidates(departmentId, teamId).map((e) => e.id));
+        if (!Array.isArray(b.staffIds) || b.staffIds.some((id) => !ok.has(Number(id)))) throw bad('Some of the chosen people do not belong to that team');
+      }
+      db.tx(() => {
+        db.update('clients', c.id, {
+          username, departmentId, teamId, status, displayName: str(b.displayName, 'Name', { max: 100 }), contact: str(b.contact, 'Contact', { max: 200 }),
+          ...(b.secretInfo !== undefined ? { secretInfo: str(b.secretInfo, 'Account details', { max: 5000 }) } : {}), updatedAt: new Date().toISOString(),
+        });
+        if (b.staffIds !== undefined) setStaff({ ...c, username, departmentId, teamId }, b.staffIds, ctx);
+        else if (moved) db.run('DELETE FROM client_staff WHERE client_id=?', c.id); // another team: the old people no longer fit
       });
       // a changed ID, department or status signs the client out
       if (status !== 'active' || departmentId !== c.departmentId || username !== c.username) db.run('DELETE FROM sessions WHERE client_id=?', c.id);
