@@ -4,6 +4,7 @@ const settings = require('../../core/settings');
 const backup = require('../../core/backup');
 const modules = require('../../core/modules');
 const notify = require('../../core/notify');
+const currency = require('../../core/currency');
 const webpush = require('../../core/webpush');
 const { HttpError, str, int, date, bad } = require('../../core/util');
 
@@ -25,7 +26,7 @@ module.exports = {
     m.get('/api/settings', { roles: any }, (ctx) => {
       const s = settings.all();
       if (ctx.user.role === 'client') return { companyName: s.companyName, currency: s.currency };
-      return { companyName: s.companyName, currency: s.currency, weeklyOff: s.weeklyOff, leaveTypes: s.leaveTypes, expenseCategories: s.expenseCategories, scoreWeights: s.scoreWeights };
+      return { companyName: s.companyName, currency: s.currency, weeklyOff: s.weeklyOff, leaveTypes: s.leaveTypes, expenseCategories: s.expenseCategories, scoreWeights: s.scoreWeights, fxRates: currency.rates() };
     });
 
     m.put('/api/settings', { roles: ['admin'] }, (ctx) => {
@@ -35,6 +36,15 @@ module.exports = {
         const c = str(b.currency, 'Currency', { required: true, max: 3 }).toUpperCase();
         if (!/^[A-Z]{3}$/.test(c)) throw bad('Currency must be a 3-letter code such as USD');
         settings.set('currency', c);
+      }
+      if (b.fxRates !== undefined) {
+        const r = {};
+        for (const c of currency.CURRENCIES) {
+          const n = Number(b.fxRates?.[c]);
+          if (!Number.isFinite(n) || n <= 0 || n > 100000) throw bad(`The rate of ${c} must be a number above 0`);
+          r[c] = Math.round(n * 1e6) / 1e6;
+        }
+        settings.set('fxRates', r);
       }
       if (b.weeklyOff !== undefined) {
         const days = (Array.isArray(b.weeklyOff) ? b.weeklyOff : []).map(Number);

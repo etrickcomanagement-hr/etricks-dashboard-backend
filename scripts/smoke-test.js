@@ -766,6 +766,81 @@ async function main() {
     check('the changes of who answers are in the activity log', ['client_chat_taken', 'client_chat_released', 'client_chat_assigned'].every((a) => acts.includes(a)));
     await admin('DELETE', `/api/clients/${c5.data.id}`);
 
+    console.log('Daily sheet: currencies, own columns, clients and live views');
+    const sh1 = (await leaderA2('POST', '/api/employees', { name: 'Sheet One', joinDate: YESTERDAY })).data;
+    const sh2 = (await leaderA2('POST', '/api/employees', { name: 'Sheet Two', joinDate: YESTERDAY })).data;
+    const mlogin = async (m) => { const c = client(); await c('POST', '/api/auth/login', { portal: 'member', departmentId: ebayId, password: 'AlphaTeam-Pass1', employeeId: m.id, pin: m.pin }); return c; };
+    const S1 = await mlogin(sh1); const S2 = await mlogin(sh2);
+    const cs = await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [sh1.id], username: 'sheet.test', password: cpw });
+    const CL6 = client();
+    await CL6('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'sheet.test', password: cpw });
+    const names6 = async (c) => (await c('GET', '/api/clients')).data.map((x) => x.username).join();
+    check('a member sees only the clients chosen for them (list, chat and the sheet\'s client menu)', await names6(S1) === 'sheet.test' && await names6(S2) === '' && (await S1('GET', '/api/orders/me')).data.clients.map((c) => c.username).join() === 'sheet.test'
+      && (await S2('GET', '/api/orders/me')).data.clients.length === 0 && (await S2('GET', `/api/clients/${cs.data.id}/chat?channel=inquiry`)).status === 404);
+    const RANGE = `from=${ymd(offset(-12))}&to=${TODAY}`;
+    const mk = (c, o) => c('POST', '/api/orders', { date: TODAY, ...o });
+    check('the currency must be AUD, USD or GBP', (await mk(S1, { orders: 1, currency: 'EUR' })).status === 400 && (await mk(S1, { orders: 1, currency: 'usd' })).status === 400);
+    const rUsd = await mk(S1, { market: 'Amazon US', store: 'Main', orders: 2, investment: 40, revenue: 100 });
+    const rAud = await mk(S1, { market: 'eBay AU', orders: 3, investment: 100, revenue: 200, currency: 'AUD' });
+    const rGbp = await mk(S1, { market: 'eBay UK', orders: 1, investment: 50, revenue: 100, currency: 'GBP', note: 'internal remark about the buyer' });
+    const mine6 = async () => (await S1('GET', `/api/orders/me?${RANGE}`)).data;
+    check('no currency means USD; rows keep their own currency', rUsd.status === 200 && (await mine6()).rows.find((r) => r.id === rUsd.data.id).currency === 'USD' && (await mine6()).rows.find((r) => r.id === rAud.data.id).currency === 'AUD');
+    let t6 = (await mine6()).totals;
+    check('totals convert AUD and GBP to the company currency (default rates), each currency also on its own', t6.orders === 6 && t6.revenue === 357 && t6.investment === 168.5 && t6.profit === 188.5 && t6.byCurrency.AUD.revenue === 200 && t6.byCurrency.GBP.investment === 50 && t6.byCurrency.USD.orders === 2, JSON.stringify(t6));
+    check('a partial edit keeps everything that was not sent (currency, store, notes)', (await S1('PUT', `/api/orders/${rGbp.data.id}`, { orders: 4 })).status === 200 && (await mine6()).rows.find((r) => r.id === rGbp.data.id).currency === 'GBP'
+      && (await mine6()).rows.find((r) => r.id === rGbp.data.id).note.includes('internal'));
+    await S1('PUT', `/api/orders/${rGbp.data.id}`, { orders: 1 });
+    check('bad numbers are refused', (await mk(S1, { orders: 1.5 })).status === 400 && (await mk(S1, { orders: 1, investment: -5 })).status === 400 && (await mk(S1, { date: ymd(offset(2)), orders: 1 })).status === 400 && (await mk(S1, {})).status === 400);
+    check('only the admin sets the exchange rates, and they must be positive numbers', (await hodNew('PUT', '/api/settings', { fxRates: { USD: 1, AUD: 0.5, GBP: 2 } })).status === 403 && (await admin('PUT', '/api/settings', { fxRates: { USD: 1, AUD: 0, GBP: 2 } })).status === 400
+      && (await admin('PUT', '/api/settings', { fxRates: { USD: 1, AUD: 'x', GBP: 2 } })).status === 400);
+    check('new rates change every total (member sheet, team list, reports)', (await admin('PUT', '/api/settings', { fxRates: { USD: 1, AUD: 0.5, GBP: 2 } })).status === 200 && (await mine6()).totals.revenue === 400
+      && (await leaderA2('GET', `/api/orders?${RANGE}`)).data.byEmployee.find((e) => e.employeeId === sh1.id).revenue === 400
+      && (await leaderA2('GET', `/api/reports/members?${RANGE}`)).data.rows.find((r) => r.employeeId === sh1.id).sales === 400
+      && (await leaderA2('GET', `/api/reports/employee/${sh1.id}?${RANGE}`)).data.orders.sales === 400);
+    await admin('PUT', '/api/settings', { fxRates: { USD: 1, AUD: 0.65, GBP: 1.27 } });
+    check('exchange rates are in the settings the admin sees', (await admin('GET', '/api/settings')).data.fxRates.AUD === 0.65);
+
+    console.log('Daily sheet: the client sees the rows shared with it');
+    check('a row can be shared only with a client the member works for', (await S1('PUT', `/api/orders/${rUsd.data.id}`, { clientId: cs.data.id })).status === 200 && (await S1('PUT', `/api/orders/${rAud.data.id}`, { clientId: c2.data.id })).status === 400
+      && (await S2('POST', '/api/orders', { date: TODAY, orders: 1, clientId: cs.data.id })).status === 400);
+    await S1('PUT', `/api/orders/${rGbp.data.id}`, { clientId: cs.data.id });
+    const prod = await S1('POST', '/api/orders/columns', { label: 'Product', kind: 'text', clientVisible: true });
+    const refund = await S1('POST', '/api/orders/columns', { label: 'Refunds', kind: 'number', clientVisible: false });
+    check('a member adds columns of their own (text or number)', prod.status === 200 && refund.status === 200 && (await mine6()).columns.length === 2);
+    check('column names must be new, and not a standard column', (await S1('POST', '/api/orders/columns', { label: 'product' })).status === 400 && (await S1('POST', '/api/orders/columns', { label: 'Profit' })).status === 400 && (await S1('POST', '/api/orders/columns', { label: '' })).status === 400
+      && (await S1('POST', '/api/orders/columns', { label: 'Weird', kind: 'date' })).status === 400);
+    check('values of the own columns are checked and unknown columns are ignored', (await S1('PUT', `/api/orders/${rUsd.data.id}`, { extra: { [refund.data.id]: 'abc' } })).status === 400
+      && (await S1('PUT', `/api/orders/${rUsd.data.id}`, { extra: { [prod.data.id]: 'Mug', [refund.data.id]: 3, 9999: 'ghost' } })).status === 200
+      && JSON.stringify((await mine6()).rows.find((r) => r.id === rUsd.data.id).extra) === JSON.stringify({ [prod.data.id]: 'Mug', [refund.data.id]: 3 }));
+    const cj = (await CL6('GET', '/api/portal/sheet')).data;
+    check('the client sees the shared rows and the columns marked for it, in order, with totals per currency', cj.rows.length === 2 && cj.rows.some((r) => r.currency === 'USD' && r.revenue === 100 && r.custom.length === 1 && r.custom[0].label === 'Product' && r.custom[0].value === 'Mug')
+      && cj.totals.USD.revenue === 100 && cj.totals.GBP.revenue === 100 && !cj.totals.AUD && cj.username === 'sheet.test');
+    const cjs = JSON.stringify(cj);
+    check('PRIVATE: no notes, no name of the writer, no unshared column and no unshared row for the client', !/internal remark|Sheet One|employee|"note"|Refunds|eBay AU/.test(cjs) && !cjs.includes('"revenue":200'));
+    check('another client sees nothing of it, staff cannot open the client sheet', (await CL2('GET', '/api/portal/sheet')).data.rows.length === 0 && (await S1('GET', '/api/portal/sheet')).status === 403 && (await anon('GET', '/api/portal/sheet')).status === 401);
+    await S1('PUT', `/api/orders/${rUsd.data.id}`, { revenue: 150 });
+    check('the client sees a change at once', (await CL6('GET', '/api/portal/sheet')).data.totals.USD.revenue === 150);
+    check('a client can search a date range', (await CL6('GET', `/api/portal/sheet?from=${ymd(offset(-30))}&to=${ymd(offset(-20))}`)).data.rows.length === 0 && (await CL6('GET', `/api/portal/sheet?from=${TODAY}&to=${YESTERDAY}`)).status === 400);
+
+    console.log('Daily sheet: leader, head and admin see it live');
+    const sv = await leaderA2('GET', `/api/orders/sheet/${sh1.id}?${RANGE}`);
+    check('the team leader opens a member\'s whole sheet: rows, own columns, client and notes', sv.status === 200 && sv.data.rows.length === 3 && sv.data.columns.length === 2 && sv.data.rows.some((r) => r.clientUsername === 'sheet.test') && sv.data.rows.some((r) => /internal remark/.test(r.note)) && sv.data.person.name === 'Sheet One');
+    check('the head and the admin can too; another team\'s leader, another department and members cannot', (await hodNew('GET', `/api/orders/sheet/${sh1.id}?${RANGE}`)).status === 200 && (await admin('GET', `/api/orders/sheet/${sh1.id}?${RANGE}`)).status === 200
+      && (await leaderB('GET', `/api/orders/sheet/${sh1.id}?${RANGE}`)).status === 403 && (await hod2('GET', `/api/orders/sheet/${sh1.id}?${RANGE}`)).status === 403 && (await S2('GET', `/api/orders/sheet/${sh1.id}`)).status === 403 && (await S1('GET', `/api/orders/sheet/${sh1.id}`)).status === 403);
+    check('the team list shows currency and client, and finds rows by client ID', (await leaderA2('GET', `/api/orders?${RANGE}&search=sheet.test`)).data.rows.length === 2 && (await leaderA2('GET', `/api/orders?${RANGE}`)).data.rows.every((r) => r.currency));
+    check('the list can be exported with currency and client', /Currency/.test((await leaderA2('GET', `/api/orders?${RANGE}&format=csv`)).data) && /Currency/.test((await S1('GET', `/api/orders/me?${RANGE}&format=csv`)).data));
+    check('deleting a column removes its values from the rows', (await S1('DELETE', `/api/orders/columns/${refund.data.id}`)).status === 200 && JSON.stringify((await mine6()).rows.find((r) => r.id === rUsd.data.id).extra) === JSON.stringify({ [prod.data.id]: 'Mug' })
+      && (await S2('DELETE', `/api/orders/columns/${prod.data.id}`)).status === 404);
+    let added = 0; for (const n of ['A', 'B', 'C', 'D', 'E']) added += (await S1('POST', '/api/orders/columns', { label: `Col ${n}` })).status === 200 ? 1 : 0;
+    check('a member can have up to 6 columns of their own', added === 5 && (await S1('POST', '/api/orders/columns', { label: 'One too many' })).status === 400 && (await mine6()).columns.length === 6);
+    const old = await mk(S1, { date: ymd(offset(-10)), orders: 1, revenue: 10 });
+    check('rows older than 7 days can be added but no longer changed', old.status === 200 && (await S1('PUT', `/api/orders/${old.data.id}`, { orders: 2 })).status === 400 && (await S1('DELETE', `/api/orders/${old.data.id}`)).status === 400);
+    check('only the writer changes or deletes a row', (await S2('PUT', `/api/orders/${rUsd.data.id}`, { orders: 9 })).status === 404 && (await leaderA2('PUT', `/api/orders/${rUsd.data.id}`, { orders: 9 })).status === 404 && (await S2('DELETE', `/api/orders/${rUsd.data.id}`)).status === 404);
+    check('deleting a row removes it from the client\'s sheet', (await S1('DELETE', `/api/orders/${rGbp.data.id}`)).status === 200 && (await CL6('GET', '/api/portal/sheet')).data.rows.length === 1);
+    check('removing a client keeps the rows and only ends the sharing', (await admin('DELETE', `/api/clients/${cs.data.id}`)).status === 200 && (await mine6()).rows.length === 3 && (await mine6()).rows.every((r) => r.clientId === null));
+    for (const m of [sh1, sh2]) await leaderA2('DELETE', `/api/employees/${m.id}`);
+    check('deleting a person removes their sheet and columns', (await admin('GET', `/api/orders?${RANGE}&search=Sheet`)).data.rows.length === 0);
+
     console.log('Client accounts');
     check('the admin edits a client (name, contact, secret, team)', (await admin('PUT', `/api/clients/${c1.data.id}`, { displayName: 'Ali Traders Group', contact: '0301-1111111', secretInfo: 'New secret', teamId: tA })).status === 200 && (await admin('GET', `/api/clients/${c1.data.id}/secret`)).data.secretInfo === 'New secret');
     check('moving the client to another team hides it from the old team and nobody of the new team gets it by themselves', (await admin('PUT', `/api/clients/${c1.data.id}`, { teamId: tB })).status === 200 && await ids(W1) === c2.data.username && !(await ids(bm)).includes('ali.traders')

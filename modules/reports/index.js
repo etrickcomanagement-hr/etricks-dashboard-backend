@@ -2,6 +2,7 @@
 const db = require('../../core/db');
 const settings = require('../../core/settings');
 const scope = require('../../core/scope');
+const { fxSql, converter } = require('../../core/currency');
 const { HttpError, range, today, addDays, monthStart, eachDay, parseYmd, oneOf, round, int } = require('../../core/util');
 
 const PRESENT = ['present', 'late', 'half_day'];
@@ -159,7 +160,7 @@ const FINANCE_COLUMNS = [
 function memberRows(from, to, scope) {
   const base = performance('employee', from, to, scope);
   const orders = Object.fromEntries(db.all(
-    `SELECT employee_id, COALESCE(SUM(orders),0) AS orders, COALESCE(SUM(investment),0) AS investment, COALESCE(SUM(revenue),0) AS revenue
+    `SELECT employee_id, COALESCE(SUM(orders),0) AS orders, COALESCE(SUM(investment * ${fxSql('currency')}),0) AS investment, COALESCE(SUM(revenue * ${fxSql('currency')}),0) AS revenue
        FROM member_orders WHERE date BETWEEN ? AND ? GROUP BY employee_id`, from, to).map((o) => [o.employeeId, o]));
   const complaints = Object.fromEntries(db.all(
     `SELECT employee_id, COUNT(*) AS total, SUM(status IN ('open','under_review')) AS open FROM complaints
@@ -183,7 +184,8 @@ function employeeReport(employeeId, from, to) {
   if (!emp) throw new HttpError(404, 'Employee not found');
   const row = memberRows(from, to, { employeeId, rolesCsv: ALL_ROLES })[0] || null;
   const orderRows = db.all('SELECT * FROM member_orders WHERE employee_id=? AND date BETWEEN ? AND ? ORDER BY date DESC, id DESC LIMIT 200', employeeId, from, to);
-  const o = orderRows.reduce((s, r) => ({ orders: s.orders + r.orders, investment: s.investment + r.investment, revenue: s.revenue + r.revenue }), { orders: 0, investment: 0, revenue: 0 });
+  const conv = converter(); // rows of other currencies are converted to the company currency for the totals
+  const o = orderRows.reduce((s, r) => ({ orders: s.orders + r.orders, investment: s.investment + conv(r.investment, r.currency), revenue: s.revenue + conv(r.revenue, r.currency) }), { orders: 0, investment: 0, revenue: 0 });
   return {
     employee: emp, from, to,
     metrics: row,
@@ -333,7 +335,7 @@ module.exports = {
       if (dept && ctx.user.role !== 'leader') {
         const teamPerf = Object.fromEntries(performance('team', mFrom, day, { departmentId: dept, rolesCsv }).map((t) => [t.teamId, t]));
         const sales = Object.fromEntries(db.all(
-          `SELECT e.team_id, COALESCE(SUM(o.orders),0) AS orders, COALESCE(SUM(o.revenue),0) AS revenue, COALESCE(SUM(o.investment),0) AS investment
+          `SELECT e.team_id, COALESCE(SUM(o.orders),0) AS orders, COALESCE(SUM(o.revenue * ${fxSql('o.currency')}),0) AS revenue, COALESCE(SUM(o.investment * ${fxSql('o.currency')}),0) AS investment
              FROM member_orders o JOIN employees e ON e.id=o.employee_id WHERE o.date>=? AND e.department_id=? GROUP BY e.team_id`, mFrom, dept).map((o) => [o.teamId, o]));
         teams = db.all('SELECT t.id, t.name, l.name AS leader_name FROM teams t LEFT JOIN employees l ON l.id=t.leader_employee_id WHERE t.department_id=? ORDER BY t.name', dept).map((t) => {
           const mine = rows.filter((r) => r.teamId === t.id && r.role === 'member');

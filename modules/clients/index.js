@@ -199,6 +199,16 @@ module.exports = {
         WHERE e.status='active' AND e.role IN ('team_leader','member') AND (c.team_id IS NULL OR e.team_id=c.team_id);`,
     // 3: the person who answers a client's chat owns the conversation
     `ALTER TABLE clients ADD COLUMN chat_owner_id INTEGER REFERENCES employees(id) ON DELETE SET NULL;`,
+    // 4: a member sees only the clients the admin chose for them. Migration 2 had given every client its whole team automatically
+    // (rows whose added_at equals the client's creation time, for clients that existed back then): those automatic rows are removed,
+    // the admin chooses the people per client (Members button). People the admin chose by hand are kept.
+    `DELETE FROM client_staff WHERE rowid IN (
+       SELECT s.rowid FROM client_staff s JOIN clients c ON c.id=s.client_id
+        WHERE s.added_at = c.created_at
+          AND c.created_at < COALESCE((SELECT applied_at FROM schema_migrations WHERE module='clients' AND version=2), '0000'));
+     UPDATE clients SET chat_owner_id=NULL WHERE chat_owner_id IS NOT NULL
+        AND chat_owner_id NOT IN (SELECT id FROM employees WHERE role='hod')
+        AND chat_owner_id NOT IN (SELECT employee_id FROM client_staff WHERE client_id=clients.id);`,
   ],
 
   routes(m) {
@@ -327,6 +337,7 @@ module.exports = {
       db.run('DELETE FROM sessions WHERE client_id=?', c.id);
       db.run("DELETE FROM notifications WHERE recipient_role='client' AND recipient_id=?", c.id);
       db.run("DELETE FROM push_subscriptions WHERE recipient_role='client' AND recipient_id=?", c.id);
+      db.run('UPDATE member_orders SET client_id=NULL WHERE client_id=?', c.id); // daily-report rows stay, only the sharing ends
       db.run('DELETE FROM clients WHERE id=?', c.id); // reports and messages go with it
       ctx.audit('client_deleted', 'client', c.id, c.username, c.departmentId);
       return { ok: true };

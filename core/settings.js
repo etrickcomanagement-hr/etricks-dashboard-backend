@@ -12,6 +12,8 @@ const DEFAULTS = {
   disabledModules: [],
   expenseCategories: ['Electricity', 'Gas', 'Water', 'Internet', 'Rent', 'Software & tools', 'Office supplies', 'Maintenance', 'Marketing', 'Other'],
   scoreWeights: { attendance: 40, tasks: 40, rating: 20 },
+  // what 1 AUD / 1 USD / 1 GBP is worth in the company currency (totals that mix currencies are converted with these)
+  fxRates: { USD: 1, AUD: 0.65, GBP: 1.27 },
 };
 
 function get(key) {
