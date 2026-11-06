@@ -14,24 +14,42 @@ const SELECT = `
     LEFT JOIN teams t ON t.id=e.team_id
     LEFT JOIN shifts s ON s.id=e.shift_id`;
 
-// Adds break totals and worked time to attendance rows.
+// A person can check in and out up to MAX_SESSIONS times a day (a day is one record with one row per check-in/check-out pair).
+const MAX_SESSIONS = 4;
+
+// Adds break totals, the sessions of the day and worked time to attendance rows.
+// check_in of the record is the first check-in of the day, check_out the last one (empty while a session is open).
 function decorate(rows) {
   if (!rows.length) return rows;
   const ids = rows.map((r) => r.id);
-  const breaks = db.all(`SELECT * FROM attendance_breaks WHERE attendance_id IN (${ids.map(() => '?').join(',')}) ORDER BY start_at`, ...ids);
+  const marks = ids.map(() => '?').join(',');
+  const breaks = db.all(`SELECT * FROM attendance_breaks WHERE attendance_id IN (${marks}) ORDER BY start_at`, ...ids);
   const byId = {};
   for (const b of breaks) (byId[b.attendanceId] ||= []).push(b);
+  const sess = db.all(`SELECT id, attendance_id, check_in, check_out FROM attendance_sessions WHERE attendance_id IN (${marks}) ORDER BY id`, ...ids);
+  const sessBy = {};
+  for (const s of sess) (sessBy[s.attendanceId] ||= []).push({ id: s.id, checkIn: s.checkIn, checkOut: s.checkOut });
   const nowIso = new Date().toISOString();
   return rows.map((r) => {
     const bs = byId[r.id] || [];
+    const ss = sessBy[r.id] || (r.checkIn ? [{ id: null, checkIn: r.checkIn, checkOut: r.checkOut }] : []);
     const breakMinutes = bs.reduce((sum, b) => sum + minutesBetween(b.startAt, b.endAt || r.checkOut || nowIso), 0);
+    // the time between two sessions is not work: only the closed sessions count
+    const inSessions = ss.filter((s) => s.checkOut).reduce((sum, s) => sum + minutesBetween(s.checkIn, s.checkOut), 0);
     return {
-      ...r, breaks: bs, breakMinutes,
+      ...r, breaks: bs, breakMinutes, sessions: ss, sessionCount: ss.length,
       onBreak: bs.some((b) => !b.endAt),
       overBreak: r.allowedBreak != null && breakMinutes > r.allowedBreak,
-      workedMinutes: r.checkIn && r.checkOut ? Math.max(0, minutesBetween(r.checkIn, r.checkOut) - breakMinutes) : null,
+      workedMinutes: r.checkIn && r.checkOut ? Math.max(0, inSessions - breakMinutes) : null,
     };
   });
+}
+
+// The record's own check_in / check_out say it all for old records; this keeps the sessions table in step with them.
+function syncSessions(attendanceId) {
+  const a = db.get('SELECT check_in, check_out FROM attendance WHERE id=?', attendanceId);
+  db.run('DELETE FROM attendance_sessions WHERE attendance_id=?', attendanceId);
+  if (a?.checkIn) db.insert('attendance_sessions', { attendanceId, checkIn: a.checkIn, checkOut: a.checkOut });
 }
 
 function lateStatus(shift, now = new Date()) {
@@ -53,7 +71,10 @@ function openRecord(employeeId) {
   const rec = db.get(
     'SELECT * FROM attendance WHERE employee_id=? AND check_in IS NOT NULL AND check_out IS NULL AND date>=? ORDER BY date DESC LIMIT 1',
     employeeId, addDays(today(), -1));
-  if (rec && Date.now() - new Date(rec.checkIn).getTime() > MAX_OPEN_HOURS * 3600e3) return null;
+  if (!rec) return null;
+  // how long the session that is open now has been open (a later session of the day is not made stale by an earlier one)
+  const openFrom = db.get('SELECT check_in FROM attendance_sessions WHERE attendance_id=? AND check_out IS NULL ORDER BY id DESC LIMIT 1', rec.id)?.checkIn || rec.checkIn;
+  if (Date.now() - new Date(openFrom).getTime() > MAX_OPEN_HOURS * 3600e3) return null;
   return rec;
 }
 const PRESENT_LIKE = ['present', 'late', 'half_day'];
@@ -72,7 +93,9 @@ function myToday(employeeId) {
   const forgot = db.get(
     'SELECT date FROM attendance WHERE employee_id=? AND check_in IS NOT NULL AND check_out IS NULL AND date<? AND date>=? AND id<>? ORDER BY date DESC LIMIT 1',
     employeeId, today(), addDays(today(), -7), record?.id ?? 0);
-  return { date: today(), state, record, shift: ownShift(employeeId), missedCheckOut: forgot?.date ?? null };
+  // after a check-out the person may check in again the same day (a second shift, back after a long break ...)
+  const canCheckInAgain = !!(record && record.checkIn && record.checkOut && record.date === today() && record.sessionCount < MAX_SESSIONS);
+  return { date: today(), state, record, shift: ownShift(employeeId), missedCheckOut: forgot?.date ?? null, canCheckInAgain, maxSessions: MAX_SESSIONS };
 }
 
 function loadForDecision(ctx, id) {
@@ -112,6 +135,12 @@ module.exports = {
     // 2: attendance of team leaders and heads needs no approval (earlier pending days are approved)
     `UPDATE attendance SET approval='approved', decided_by='Automatic (no approval needed)', decided_at=created_at
       WHERE approval<>'approved' AND employee_id IN (SELECT id FROM employees WHERE role<>'member');`,
+    // 3: several check-ins and check-outs in one day. Every record that has a check-in gets its first session.
+    `CREATE TABLE attendance_sessions (
+       id INTEGER PRIMARY KEY, attendance_id INTEGER NOT NULL REFERENCES attendance(id) ON DELETE CASCADE,
+       check_in TEXT NOT NULL, check_out TEXT);
+     CREATE INDEX idx_attsess ON attendance_sessions(attendance_id);
+     INSERT INTO attendance_sessions(attendance_id, check_in, check_out) SELECT id, check_in, check_out FROM attendance WHERE check_in IS NOT NULL;`,
   ],
 
   routes(m) {
@@ -133,16 +162,28 @@ module.exports = {
             if (!existing.checkIn && !existing.checkOut && PRESENT_LIKE.includes(existing.status)) {
               // a leader marked the day without times: the real check-in completes it (approval stays as the leader set it)
               db.update('attendance', existing.id, { checkIn: nowIso, status: existing.status === 'present' ? lateStatus(ownShift(empId)) : existing.status });
+              db.insert('attendance_sessions', { attendanceId: existing.id, checkIn: nowIso });
               return;
             }
-            throw bad(existing.checkIn ? 'You have already checked in today' : `Today is already marked as ${existing.status.replace('_', ' ')} by your leader. Ask them to change it if that is not right`);
+            if (existing.checkIn && existing.checkOut) {
+              // checked out earlier today: this is another session of the same day
+              const have = db.get('SELECT COUNT(*) AS n FROM attendance_sessions WHERE attendance_id=?', existing.id).n;
+              if (have === 0) syncSessions(existing.id); // an old record without its session row
+              if (Math.max(have, 1) >= MAX_SESSIONS) throw bad(`You can check in up to ${MAX_SESSIONS} times a day`);
+              db.insert('attendance_sessions', { attendanceId: existing.id, checkIn: nowIso });
+              // more hours were added to the day: a member's leader looks at it again
+              db.update('attendance', existing.id, { checkOut: null, approval: ctx.user.role === 'member' ? 'pending' : existing.approval });
+              return;
+            }
+            throw bad(existing.checkIn ? 'You are already checked in' : `Today is already marked as ${existing.status.replace('_', ' ')} by your leader. Ask them to change it if that is not right`);
           }
           // an earlier day that was never closed gets a note for the leader
           db.run("UPDATE attendance SET note=COALESCE(NULLIF(note,''), 'No check-out recorded') WHERE employee_id=? AND check_in IS NOT NULL AND check_out IS NULL AND date<?", empId, today());
-          db.insert('attendance', {
+          const created = db.insert('attendance', {
             employeeId: empId, date: today(), checkIn: nowIso, status: lateStatus(ownShift(empId)), createdAt: nowIso,
             ...(ctx.user.role === 'member' ? {} : { approval: 'approved', decidedBy: AUTO, decidedAt: nowIso }),
           });
+          db.insert('attendance_sessions', { attendanceId: created.id, checkIn: nowIso });
           return;
         }
         const rec = openRecord(empId);
@@ -156,6 +197,9 @@ module.exports = {
           db.update('attendance_breaks', openBreak.id, { endAt: nowIso });
         } else {
           if (openBreak) db.update('attendance_breaks', openBreak.id, { endAt: nowIso });
+          const openSession = db.get('SELECT id FROM attendance_sessions WHERE attendance_id=? AND check_out IS NULL ORDER BY id DESC LIMIT 1', rec.id);
+          if (openSession) db.update('attendance_sessions', openSession.id, { checkOut: nowIso });
+          else syncSessions(rec.id); // an old record: its own times become the session
           // Re-submitting for approval whenever the day is closed keeps the leader's view current.
           db.update('attendance', rec.id, { checkOut: nowIso, approval: ctx.user.role === 'member' && rec.approval === 'rejected' ? 'pending' : rec.approval });
         }
@@ -168,7 +212,9 @@ module.exports = {
         const r = result.record;
         // Members tell their team leader (or the head), leaders their head; leaders and heads are checked by the admin too.
         notify.toSuperiors(empId, action === 'check_in'
-          ? { title: `${emp.name} checked in`, body: `At ${hm(r.checkIn)}${r.status === 'late' ? ' (late)' : ''}`, link: '#/attendance', kind: 'attendance' }
+          ? (r.sessionCount > 1
+            ? { title: `${emp.name} checked in again`, body: `At ${hm(r.sessions.at(-1).checkIn)} (session ${r.sessionCount} today)`, link: '#/attendance', kind: 'attendance' }
+            : { title: `${emp.name} checked in`, body: `At ${hm(r.checkIn)}${r.status === 'late' ? ' (late)' : ''}`, link: '#/attendance', kind: 'attendance' })
           : { title: `${emp.name} checked out`, body: `At ${hm(r.checkOut)}${r.workedMinutes != null ? ` · worked ${Math.floor(r.workedMinutes / 60)}h ${r.workedMinutes % 60}m` : ''}${r.overBreak ? ' · break over the allowed time' : ''}`, link: '#/attendance', kind: 'attendance' },
           { alsoAdmin: emp.role !== 'member' });
       }
@@ -201,7 +247,7 @@ module.exports = {
         return ctx.csv('attendance.csv', [
           { label: 'Date', key: 'date' }, { label: 'Code', key: 'empCode' }, { label: 'Employee', key: 'employeeName' }, { label: 'Role', key: 'role' },
           { label: 'Department', key: 'departmentName' }, { label: 'Team', key: 'teamName' }, { label: 'Status', key: 'status' },
-          { label: 'Check in', value: (r) => tm(r.checkIn) }, { label: 'Check out', value: (r) => tm(r.checkOut) },
+          { label: 'Check in', value: (r) => tm(r.checkIn) }, { label: 'Check out', value: (r) => tm(r.checkOut) }, { label: 'Sessions', key: 'sessionCount' },
           { label: 'Break (min)', key: 'breakMinutes' }, { label: 'Worked (min)', key: 'workedMinutes' },
           { label: 'Approval', key: 'approval' }, { label: 'Decided by', key: 'decidedBy' }, { label: 'Note', key: 'note' },
         ], rows);
@@ -297,6 +343,7 @@ module.exports = {
       } else {
         id = db.insert('attendance', { employeeId: empId, date: day, createdAt: new Date().toISOString(), ...data }).id;
       }
+      if ('checkIn' in data || 'checkOut' in data) syncSessions(id); // the leader's times replace the sessions of that day
       ctx.audit('attendance_manual', 'attendance', id, `${emp.name} ${day} ${status}`, emp.departmentId);
       return { id };
     });

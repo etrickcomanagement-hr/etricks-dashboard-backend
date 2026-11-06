@@ -338,6 +338,7 @@ module.exports = {
       db.run("DELETE FROM notifications WHERE recipient_role='client' AND recipient_id=?", c.id);
       db.run("DELETE FROM push_subscriptions WHERE recipient_role='client' AND recipient_id=?", c.id);
       db.run('UPDATE member_orders SET client_id=NULL WHERE client_id=?', c.id); // daily-report rows stay, only the sharing ends
+      db.run('DELETE FROM sheet_publications WHERE client_id=?', c.id);
       db.run('DELETE FROM clients WHERE id=?', c.id); // reports and messages go with it
       ctx.audit('client_deleted', 'client', c.id, c.username, c.departmentId);
       return { ok: true };

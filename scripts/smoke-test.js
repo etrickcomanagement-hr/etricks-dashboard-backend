@@ -812,15 +812,34 @@ async function main() {
     check('values of the own columns are checked and unknown columns are ignored', (await S1('PUT', `/api/orders/${rUsd.data.id}`, { extra: { [refund.data.id]: 'abc' } })).status === 400
       && (await S1('PUT', `/api/orders/${rUsd.data.id}`, { extra: { [prod.data.id]: 'Mug', [refund.data.id]: 3, 9999: 'ghost' } })).status === 200
       && JSON.stringify((await mine6()).rows.find((r) => r.id === rUsd.data.id).extra) === JSON.stringify({ [prod.data.id]: 'Mug', [refund.data.id]: 3 }));
-    const cj = (await CL6('GET', '/api/portal/sheet')).data;
-    check('the client sees the shared rows and the columns marked for it, in order, with totals per currency', cj.rows.length === 2 && cj.rows.some((r) => r.currency === 'USD' && r.revenue === 100 && r.custom.length === 1 && r.custom[0].label === 'Product' && r.custom[0].value === 'Mug')
-      && cj.totals.USD.revenue === 100 && cj.totals.GBP.revenue === 100 && !cj.totals.AUD && cj.username === 'sheet.test');
-    const cjs = JSON.stringify(cj);
-    check('PRIVATE: no notes, no name of the writer, no unshared column and no unshared row for the client', !/internal remark|Sheet One|employee|"note"|Refunds|eBay AU/.test(cjs) && !cjs.includes('"revenue":200'));
-    check('another client sees nothing of it, staff cannot open the client sheet', (await CL2('GET', '/api/portal/sheet')).data.rows.length === 0 && (await S1('GET', '/api/portal/sheet')).status === 403 && (await anon('GET', '/api/portal/sheet')).status === 401);
+    const SHEETPERIOD = { from: ymd(offset(-12)), to: TODAY };
+    const publish = (c, clientId, extra = {}) => c('POST', '/api/orders/publish', { clientId, ...SHEETPERIOD, ...extra });
+    const csheet = async (c = CL6) => (await c('GET', '/api/portal/sheet')).data;
+    const cs2 = await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [sh1.id], username: 'sheet.two', password: cpw });
+    check('the client sees nothing of the sheet until the member presses Update', (await csheet()).sheets.length === 0 && (await CL6('GET', '/api/portal/sheet/stamp')).data.stamp === '');
+    check('Update client: only to a client the member works for, a real period, and only with rows', (await publish(S1, c2.data.id)).status === 400 && (await publish(S2, cs.data.id)).status === 400 && (await publish(S1, cs.data.id, { from: TODAY, to: YESTERDAY })).status === 400
+      && (await publish(S1, cs.data.id, { from: ymd(offset(-400)) })).status === 400 && (await publish(S1, cs.data.id, { from: ymd(offset(-30)), to: ymd(offset(-20)) })).status === 400 && (await publish(S1, 'x')).status === 400);
+    check('only team members and leaders can update a client, never the head, the client or a stranger', (await publish(hodNew, cs.data.id)).status === 403 && (await publish(CL6, cs.data.id)).status === 403 && (await publish(anon, cs.data.id)).status === 401);
+    const pub1 = await publish(S1, cs.data.id);
+    check('Update client sends a copy of the sheet', pub1.status === 200 && pub1.data.rows === 3 && pub1.data.upToDate === true && (await S1('GET', `/api/orders/me?${RANGE}`)).data.published[0].upToDate === true);
+    const v1 = await csheet(); const sh = v1.sheets[0];
+    check('the client sees the sheet as it is: every row, every column of the member, the notes, the totals per currency', v1.sheets.length === 1 && sh.title === 'Sheet' && sh.rows.length === 3 && sh.columns.map((c) => c.label).join() === 'Product,Refunds'
+      && sh.rows.some((r) => /internal remark/.test(r.note)) && sh.rows.some((r) => r.extra[prod.data.id] === 'Mug') && sh.rows.some((r) => r.currency === 'AUD' && r.revenue === 200) && sh.totals.USD.revenue === 100 && sh.totals.AUD.revenue === 200 && sh.totals.GBP.revenue === 100
+      && v1.username === 'sheet.test' && !!sh.publishedAt && sh.from === SHEETPERIOD.from && sh.to === SHEETPERIOD.to);
+    check('PRIVATE: nothing tells the client who wrote it', !/Sheet One|employee|sh1/i.test(JSON.stringify(v1)) && !Object.keys(sh.rows[0]).some((k) => /employee|client|id$/i.test(k)));
+    check('the client is told, without any figure', (await note(CL6, /Your sheet was updated/)).length === 1 && !JSON.stringify((await CL6('GET', '/api/notifications?limit=100')).data).includes('internal remark'));
+    check('another client sees nothing of it; staff cannot open the client sheet', (await csheet(CL2)).sheets.length === 0 && (await S1('GET', '/api/portal/sheet')).status === 403 && (await anon('GET', '/api/portal/sheet')).status === 401 && (await S1('GET', '/api/portal/sheet/stamp')).status === 403);
+    const stamp1 = (await CL6('GET', '/api/portal/sheet/stamp')).data.stamp;
     await S1('PUT', `/api/orders/${rUsd.data.id}`, { revenue: 150 });
-    check('the client sees a change at once', (await CL6('GET', '/api/portal/sheet')).data.totals.USD.revenue === 150);
-    check('a client can search a date range', (await CL6('GET', `/api/portal/sheet?from=${ymd(offset(-30))}&to=${ymd(offset(-20))}`)).data.rows.length === 0 && (await CL6('GET', `/api/portal/sheet?from=${TODAY}&to=${YESTERDAY}`)).status === 400);
+    check('edits do not reach the client by themselves; the member sees that changes are not sent yet', (await csheet()).sheets[0].totals.USD.revenue === 100 && (await CL6('GET', '/api/portal/sheet/stamp')).data.stamp === stamp1
+      && (await S1('GET', `/api/orders/me?${RANGE}`)).data.published[0].upToDate === false);
+    await new Promise((r) => setTimeout(r, 15)); // a later time than the first update
+    const pub2 = await publish(S1, cs.data.id);
+    check('Update again: the client sees the new figures, the same single sheet, and the stamp changes', pub2.status === 200 && (await csheet()).sheets.length === 1 && (await csheet()).sheets[0].totals.USD.revenue === 150 && (await CL6('GET', '/api/portal/sheet/stamp')).data.stamp !== stamp1
+      && (await S1('GET', `/api/orders/me?${RANGE}`)).data.published[0].upToDate === true);
+    check('a new row or column of the member reaches the client with the next update, as it is', (await S1('PUT', `/api/orders/${rAud.data.id}`, { clientId: cs2.data.id })).status === 200 && (await publish(S1, cs.data.id)).data.rows === 2
+      && (await csheet()).sheets[0].rows.every((r) => r.currency !== 'AUD') && (await publish(S1, cs2.data.id)).data.rows === 1);
+    check('rows tagged for another client are left out of this client\'s sheet', (await csheet()).sheets[0].totals.AUD === undefined);
 
     console.log('Daily sheet: leader, head and admin see it live');
     const sv = await leaderA2('GET', `/api/orders/sheet/${sh1.id}?${RANGE}`);
@@ -836,8 +855,13 @@ async function main() {
     const old = await mk(S1, { date: ymd(offset(-10)), orders: 1, revenue: 10 });
     check('rows older than 7 days can be added but no longer changed', old.status === 200 && (await S1('PUT', `/api/orders/${old.data.id}`, { orders: 2 })).status === 400 && (await S1('DELETE', `/api/orders/${old.data.id}`)).status === 400);
     check('only the writer changes or deletes a row', (await S2('PUT', `/api/orders/${rUsd.data.id}`, { orders: 9 })).status === 404 && (await leaderA2('PUT', `/api/orders/${rUsd.data.id}`, { orders: 9 })).status === 404 && (await S2('DELETE', `/api/orders/${rUsd.data.id}`)).status === 404);
-    check('deleting a row removes it from the client\'s sheet', (await S1('DELETE', `/api/orders/${rGbp.data.id}`)).status === 200 && (await CL6('GET', '/api/portal/sheet')).data.rows.length === 1);
-    check('removing a client keeps the rows and only ends the sharing', (await admin('DELETE', `/api/clients/${cs.data.id}`)).status === 200 && (await mine6()).rows.length === 3 && (await mine6()).rows.every((r) => r.clientId === null));
+    check('deleting a row changes the client\'s sheet only with the next update', (await S1('DELETE', `/api/orders/${rGbp.data.id}`)).status === 200 && (await csheet()).sheets[0].rows.length === 2 && (await publish(S1, cs.data.id)).data.rows === 2
+      && (await csheet()).sheets[0].rows.length === 2);
+    check('the member can stop showing the sheet to a client', (await S1('DELETE', `/api/orders/publish/${cs.data.id}`)).status === 200 && (await csheet()).sheets.length === 0 && (await S2('DELETE', `/api/orders/publish/${cs.data.id}`)).status === 200);
+    check('the team leader sees when the client was last updated', (await leaderA2('GET', `/api/orders/sheet/${sh1.id}?${RANGE}`)).data.published.map((p) => p.username).join() === 'sheet.two');
+    await publish(S1, cs.data.id);
+    check('removing a client keeps the rows, ends the sharing and removes the copy', (await admin('DELETE', `/api/clients/${cs2.data.id}`)).status === 200 && (await admin('DELETE', `/api/clients/${cs.data.id}`)).status === 200 && (await mine6()).rows.length === 3 && (await mine6()).rows.every((r) => r.clientId === null)
+      && (await S1('GET', `/api/orders/me?${RANGE}`)).data.published.length === 0);
     for (const m of [sh1, sh2]) await leaderA2('DELETE', `/api/employees/${m.id}`);
     check('deleting a person removes their sheet and columns', (await admin('GET', `/api/orders?${RANGE}&search=Sheet`)).data.rows.length === 0);
 
@@ -888,6 +912,31 @@ async function main() {
     const t3 = (await P3('GET', '/api/attendance/me/today')).data;
     const ci3 = await P3('POST', '/api/attendance/me/action', { action: 'check_in' });
     check('a day marked absent is explained, not silently blocked', t3.state === 'done' && ci3.status === 400 && /marked as absent/.test(ci3.data.error || ''));
+    console.log('Attendance: check in and out several times a day');
+    const act = (c, action) => c('POST', '/api/attendance/me/action', { action });
+    const todayOf = async (c) => (await c('GET', '/api/attendance/me/today')).data;
+    const t1b = await todayOf(P1);
+    check('after a check-out the member may check in again the same day', t1b.state === 'done' && t1b.canCheckInAgain === true && t1b.record.sessionCount === 1 && t1b.maxSessions === 4);
+    await leaderA2('POST', `/api/attendance/${t1b.record.id}/decision`, { approval: 'approved' });
+    const again = await act(P1, 'check_in');
+    check('a second check-in starts a new session of the same day, and the leader looks at the day again', again.status === 200 && again.data.state === 'working' && again.data.record.sessionCount === 2 && !again.data.record.checkOut && again.data.record.approval === 'pending' && again.data.canCheckInAgain === false);
+    check('the leader is told it is a second session', (await note(leaderA2, /Punch One checked in again/)).length === 1);
+    check('checking in while already working is still refused', /already checked in/.test((await act(P1, 'check_in')).data.error || ''));
+    check('breaks and the second check-out work as before', (await act(P1, 'break_start')).data.state === 'on_break' && (await act(P1, 'break_end')).data.state === 'working' && (await act(P1, 'check_out')).data.state === 'done');
+    const t1c = await todayOf(P1);
+    check('the day lists both sessions and the worked time is the sessions, not the gap between them', t1c.record.sessions.length === 2 && t1c.record.sessions.every((x) => x.checkIn && x.checkOut) && t1c.record.workedMinutes === 0 && t1c.canCheckInAgain === true);
+    await act(P1, 'check_in'); await act(P1, 'check_out');
+    await act(P1, 'check_in'); await act(P1, 'check_out');
+    const fifth = await act(P1, 'check_in');
+    check('up to 4 sessions a day, then a clear message', fifth.status === 400 && /up to 4 times a day/.test(fifth.data.error || '') && (await todayOf(P1)).record.sessionCount === 4 && (await todayOf(P1)).canCheckInAgain === false);
+    const boardP1 = (await leaderA2('GET', `/api/attendance/board?date=${TODAY}`)).data.rows.find((r) => r.id === pm['Punch One'].id);
+    check('the team board shows the first check-in, the last check-out and the number of sessions', boardP1.record.sessionCount === 4 && !!boardP1.record.checkIn && !!boardP1.record.checkOut);
+    check('a day marked absent can never be checked in again', t3.state === 'done' && (await todayOf(P3)).canCheckInAgain === false);
+    check('a day a leader marked without times can be completed, then checked in again', (await act(P2, 'check_out')).data.state === 'done' && (await todayOf(P2)).canCheckInAgain === true && (await act(P2, 'check_in')).data.record.sessionCount === 2);
+    const fix = await leaderA2('POST', '/api/attendance/manual', { employeeId: pm['Punch One'].id, date: TODAY, status: 'present', checkIn: '09:00', checkOut: '12:00' });
+    const t1d = await todayOf(P1);
+    check('a leader correcting the times replaces the sessions of that day', fix.status === 200 && t1d.record.sessions.length === 1 && t1d.record.workedMinutes === 180);
+    check('the records export has the number of sessions', /Sessions/.test((await leaderA2('GET', `/api/attendance?from=${TODAY}&to=${TODAY}&format=csv`)).data));
     for (const n of Object.keys(pm)) await leaderA2('DELETE', `/api/employees/${pm[n].id}`);
 
     console.log('Admin, logs, backups');

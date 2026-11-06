@@ -32,7 +32,8 @@ function employeeMetrics(from, to, { departmentId = null, teamId = null, employe
   const att = db.all(
     `SELECT a.employee_id, a.date, a.status, a.approval, a.check_in, a.check_out,
             COALESCE((SELECT SUM((julianday(COALESCE(b.end_at, a.check_out, a.check_in)) - julianday(b.start_at)) * 1440)
-                        FROM attendance_breaks b WHERE b.attendance_id=a.id), 0) AS break_min
+                        FROM attendance_breaks b WHERE b.attendance_id=a.id), 0) AS break_min,
+            (SELECT SUM((julianday(s.check_out) - julianday(s.check_in)) * 1440) FROM attendance_sessions s WHERE s.attendance_id=a.id AND s.check_out IS NOT NULL) AS session_min
        FROM attendance a WHERE a.date BETWEEN ? AND ? AND a.approval<>'rejected'`, from, to);
   const attBy = {};
   for (const a of att) (attBy[a.employeeId] ||= []).push(a);
@@ -71,7 +72,7 @@ function employeeMetrics(from, to, { departmentId = null, teamId = null, employe
         present += r.status === 'half_day' ? 0.5 : 1;
         if (r.status === 'late') late++;
         if (r.checkIn && r.checkOut) {
-          workedMin += Math.max(0, (new Date(r.checkOut) - new Date(r.checkIn)) / 60000 - r.breakMin);
+          workedMin += Math.max(0, (r.sessionMin ?? (new Date(r.checkOut) - new Date(r.checkIn)) / 60000) - r.breakMin);
           workedDays++;
         }
       } else if (leaveDates.has(d) || r?.status === 'leave') leaveDays++;

@@ -1,5 +1,7 @@
 'use strict';
+const crypto = require('node:crypto');
 const db = require('../../core/db');
+const notify = require('../../core/notify');
 const { loadEmployee } = require('../../core/scope');
 const { converter, rates, CURRENCIES } = require('../../core/currency');
 const { HttpError, int, str, num, date, oneOf, range, today, addDays, bad, round, parseJson } = require('../../core/util');
@@ -10,8 +12,9 @@ const { HttpError, int, str, num, date, oneOf, range, today, addDays, bad, round
  *
  *   - A team leader sees their team, the head of department all teams of the department, the admin everyone. The same rows
  *     are the figures behind the reports and dashboards (converted to the company currency with the rates in Settings).
- *   - A row can be tagged with one of the client IDs the member works for. That client sees the row (never the notes, never
- *     who wrote it) on the "Daily Sheet" page of the portal, live.
+ *   - The member edits the sheet freely (leaders, heads and the admin see it live). The client sees it only when the member
+ *     presses "Update client": that sends a copy of the sheet exactly as it is (every column, every row, notes too) for the
+ *     period on screen. Rows tagged with another client are left out. The client never learns who wrote it.
  *   - These figures are NOT added to the department Finance page automatically (avoids double counting).
  */
 const MAX_COLUMNS = 6;
@@ -68,6 +71,12 @@ module.exports = {
        id INTEGER PRIMARY KEY, employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE, label TEXT NOT NULL,
        kind TEXT NOT NULL DEFAULT 'text', client_visible INTEGER NOT NULL DEFAULT 0, position INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
      CREATE INDEX idx_oc_emp ON order_columns(employee_id);`,
+    // 4: "Update client": the copy of the sheet a client sees (one per member and client, replaced by every update)
+    `CREATE TABLE sheet_publications (
+       id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL, employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+       from_date TEXT NOT NULL, to_date TEXT NOT NULL, data TEXT NOT NULL, hash TEXT NOT NULL, row_count INTEGER NOT NULL DEFAULT 0,
+       published_at TEXT NOT NULL, UNIQUE (client_id, employee_id));
+     CREATE INDEX idx_pub_client ON sheet_publications(client_id);`,
   ],
 
   routes(m) {
@@ -117,6 +126,23 @@ module.exports = {
     // ---- members and team leaders write their own daily report ----
     // The admin and the head of department see the leaders' reports; a leader sees only the reports of their team's members.
     const sheetOf = (employeeId, from, to) => db.all(`${SELECT} WHERE o.employee_id=? AND o.date BETWEEN ? AND ? ORDER BY o.date DESC, o.id DESC LIMIT 2000`, employeeId, from, to).map(shape);
+    // What a client would see right now: every row of the period that is not tagged for another client, and every column.
+    const snapshotFor = (employeeId, clientId, from, to) => {
+      const rows = db.all(`${SELECT} WHERE o.employee_id=? AND o.date BETWEEN ? AND ? AND (o.client_id IS NULL OR o.client_id=?) ORDER BY o.date, o.id LIMIT 2000`, employeeId, from, to, clientId).map(shape);
+      const data = {
+        columns: myColumns(employeeId).map((c) => ({ id: c.id, label: c.label, kind: c.kind })),
+        rows: rows.map((r) => ({
+          date: r.date, market: r.market, store: r.store, currency: r.currency, orders: r.orders, investment: r.investment, revenue: r.revenue,
+          profit: round(r.revenue - r.investment), note: r.note, extra: r.extra,
+        })),
+      };
+      return { data, hash: crypto.createHash('sha256').update(JSON.stringify(data)).digest('hex').slice(0, 24) };
+    };
+    // The copies this person has sent, and whether each is still the same as the sheet now.
+    const publicationsOf = (employeeId) => db.all(
+      `SELECT p.client_id, p.from_date, p.to_date, p.hash, p.row_count, p.published_at, c.username FROM sheet_publications p JOIN clients c ON c.id=p.client_id WHERE p.employee_id=? ORDER BY p.id`, employeeId)
+      .map((p) => ({ clientId: p.clientId, username: p.username, publishedAt: p.publishedAt, from: p.fromDate, to: p.toDate, rows: p.rowCount, upToDate: snapshotFor(employeeId, p.clientId, p.fromDate, p.toDate).hash === p.hash }));
+
     const csvColumns = [
       { label: 'Date', key: 'date' }, { label: 'Market', key: 'market' }, { label: 'Store name', key: 'store' }, { label: 'Client', key: 'clientUsername' }, { label: 'Currency', key: 'currency' },
       { label: 'Orders received', key: 'orders' }, { label: 'Purchasing cost', key: 'investment' }, { label: 'Total sales', key: 'revenue' }, { label: 'Profit', value: (r) => round(r.profit) },
@@ -127,7 +153,36 @@ module.exports = {
       const { from, to } = range(ctx.query);
       const rows = sheetOf(ctx.user.employeeId, from, to);
       if (ctx.query.format === 'csv') return ctx.csv('my-daily-reports.csv', csvColumns, rows);
-      return { rows, totals: totals(rows), columns: myColumns(ctx.user.employeeId), clients: myClients(ctx), fx: rates(), currencies: CURRENCIES, editDays: EDIT_DAYS };
+      return { rows, totals: totals(rows), columns: myColumns(ctx.user.employeeId), clients: myClients(ctx), fx: rates(), currencies: CURRENCIES, editDays: EDIT_DAYS, published: publicationsOf(ctx.user.employeeId) };
+    });
+
+    // "Update client": send the client a copy of the sheet as it is now.
+    m.post('/api/orders/publish', { roles: self }, (ctx) => {
+      const clientId = int(ctx.body.clientId, 'Client', { required: true });
+      const client = myClients(ctx).find((c) => c.id === clientId);
+      if (!client) throw bad('You can only update a client you work for');
+      const from = date(ctx.body.from, 'From', { required: true });
+      const to = date(ctx.body.to, 'To', { required: true });
+      if (from > to) throw bad('"To" cannot be before "From"');
+      if (from < addDays(to, -366)) throw bad('Send up to one year at a time');
+      const { data, hash } = snapshotFor(ctx.user.employeeId, clientId, from, to);
+      if (!data.rows.length) throw bad('Nothing to send: your sheet has no rows in this period');
+      const now = new Date().toISOString();
+      db.run(
+        `INSERT INTO sheet_publications(client_id, employee_id, from_date, to_date, data, hash, row_count, published_at) VALUES (?,?,?,?,?,?,?,?)
+         ON CONFLICT(client_id, employee_id) DO UPDATE SET from_date=excluded.from_date, to_date=excluded.to_date, data=excluded.data, hash=excluded.hash, row_count=excluded.row_count, published_at=excluded.published_at`,
+        clientId, ctx.user.employeeId, from, to, JSON.stringify(data), hash, data.rows.length, now);
+      ctx.audit('sheet_published', 'orders', clientId, `${client.username}: ${data.rows.length} rows, ${from} to ${to}`); // never the figures
+      notify.send({ clientId }, { title: 'Your sheet was updated', body: 'Open the Daily Sheet page of your portal.', link: '#/portal-sheet', kind: 'sheet' });
+      return { clientId, username: client.username, publishedAt: now, rows: data.rows.length, from, to, upToDate: true };
+    });
+
+    // Stop showing the sheet to a client.
+    m.del('/api/orders/publish/:clientId', { roles: self }, (ctx) => {
+      const clientId = int(ctx.params.clientId, 'Client', { required: true });
+      const n = db.run('DELETE FROM sheet_publications WHERE client_id=? AND employee_id=?', clientId, ctx.user.employeeId).changes;
+      if (n) ctx.audit('sheet_unpublished', 'orders', clientId, null);
+      return { ok: true };
     });
 
     m.post('/api/orders', { roles: self }, (ctx) => {
@@ -240,28 +295,22 @@ module.exports = {
       const { from, to } = range(ctx.query);
       const rows = sheetOf(emp.id, from, to);
       const team = emp.teamId ? db.get('SELECT name FROM teams WHERE id=?', emp.teamId)?.name : null;
-      return { person: { id: emp.id, name: emp.name, empCode: emp.empCode, role: emp.role, teamName: team }, rows, totals: totals(rows), columns: myColumns(emp.id), fx: rates(), from, to };
+      return { person: { id: emp.id, name: emp.name, empCode: emp.empCode, role: emp.role, teamName: team }, rows, totals: totals(rows), columns: myColumns(emp.id), fx: rates(), from, to, published: publicationsOf(emp.id) };
     });
 
-    // ---- the client's view: the rows shared with it, never the notes and never who wrote them ----
+    // ---- the client's view: the copies of the sheet the team sent, exactly as sent ----
+    // One sheet per member who updated this client; the client never learns who ("Sheet 1", "Sheet 2" only when there are several).
     m.get('/api/portal/sheet', { roles: ['client'] }, (ctx) => {
-      const day = today();
-      const from = ctx.query.from ? date(ctx.query.from, 'From') : addDays(day, -60);
-      const to = ctx.query.to ? date(ctx.query.to, 'To') : day;
-      if (from > to) throw bad('"To" cannot be before "From"');
-      const raw = db.all(
-        `SELECT employee_id, date, market, store, currency, orders, investment, revenue, extra FROM member_orders
-          WHERE client_id=? AND date BETWEEN ? AND ? ORDER BY date DESC, id DESC LIMIT 1000`, ctx.user.clientId, from, to);
-      const visible = {};
-      for (const c of db.all('SELECT id, label, employee_id FROM order_columns WHERE client_visible=1')) (visible[c.employeeId] ||= []).push(c);
-      const rows = raw.map((r) => {
-        const x = parseJson(r.extra, {});
-        return {
-          date: r.date, market: r.market, store: r.store, currency: r.currency, orders: r.orders, investment: r.investment, revenue: r.revenue, profit: round(r.revenue - r.investment),
-          custom: (visible[r.employeeId] || []).filter((c) => x[c.id] !== undefined && x[c.id] !== null).map((c) => ({ label: c.label, value: x[c.id] })),
-        };
+      const pubs = db.all('SELECT id, from_date, to_date, data, published_at FROM sheet_publications WHERE client_id=? ORDER BY id', ctx.user.clientId);
+      const sheets = pubs.map((p, i) => {
+        const d = parseJson(p.data, { columns: [], rows: [] });
+        return { title: pubs.length > 1 ? `Sheet ${i + 1}` : 'Sheet', publishedAt: p.publishedAt, from: p.fromDate, to: p.toDate, columns: d.columns, rows: d.rows, totals: totals(d.rows).byCurrency };
       });
-      return { username: db.get('SELECT username FROM clients WHERE id=?', ctx.user.clientId)?.username ?? null, rows, totals: totals(raw.map((r) => ({ ...r }))).byCurrency, from, to };
+      return { username: db.get('SELECT username FROM clients WHERE id=?', ctx.user.clientId)?.username ?? null, sheets };
     });
+    // A tiny answer the page asks every few seconds: it loads the sheets only when this changes.
+    m.get('/api/portal/sheet/stamp', { roles: ['client'] }, (ctx) => ({
+      stamp: db.all('SELECT id, published_at FROM sheet_publications WHERE client_id=? ORDER BY id', ctx.user.clientId).map((p) => `${p.id}:${p.publishedAt}`).join('|'),
+    }));
   },
 };
