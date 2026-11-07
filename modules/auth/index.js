@@ -5,6 +5,7 @@ const config = require('../../core/config');
 const db = require('../../core/db');
 const settings = require('../../core/settings');
 const credentials = require('../../core/credentials');
+const gate = require('../../core/gate');
 const { HttpError, str, int, oneOf, bad } = require('../../core/util');
 
 const cookie = (token, maxAgeSec) =>
@@ -78,7 +79,7 @@ module.exports = {
   routes(m) {
     // One call tells the website who is signed in and, for a signed-in person, the settings and modules (saves round trips).
     m.get('/api/auth/me', (ctx) => {
-      const out = { user: publicUser(ctx.user), companyName: settings.get('companyName') };
+      const out = { user: publicUser(ctx.user), companyName: settings.get('companyName'), gate: { required: gate.enabled(), passed: !!ctx.user || gate.passed(ctx.req) } };
       if (ctx.user) {
         const s = settings.all();
         // a client gets only what their portal needs
@@ -87,6 +88,30 @@ module.exports = {
         out.modules = require('../../core/modules').describe();
       }
       return out;
+    });
+
+    // ---- the website access password ----
+    m.get('/api/gate', (ctx) => ({ required: gate.enabled(), passed: gate.passed(ctx.req) }));
+    m.post('/api/gate', (ctx) => {
+      if (!gate.enabled()) return { ok: true };
+      const key = `gate|${ctx.ip}`;
+      auth.throttle.check(key);
+      if (!gate.check(ctx.body.password)) { auth.throttle.fail(key); ctx.audit('gate_failed', 'gate', null, null); throw new HttpError(401, 'Incorrect access password'); }
+      auth.throttle.ok(key);
+      ctx.res.setHeader('Set-Cookie', gate.cookieHeader(config.secureCookies));
+      return { ok: true };
+    });
+    m.get('/api/gate/status', { roles: ['admin'] }, () => gate.status());
+    m.put('/api/gate', { roles: ['admin'] }, (ctx) => {
+      gate.set(accounts.validatePassword(ctx.body.password, 'Access password'));
+      ctx.res.setHeader('Set-Cookie', gate.cookieHeader(config.secureCookies)); // the admin's own browser keeps working
+      ctx.audit('gate_changed', 'gate', null, null);
+      return gate.status();
+    });
+    m.del('/api/gate', { roles: ['admin'] }, (ctx) => {
+      gate.clear();
+      ctx.audit('gate_removed', 'gate', null, null);
+      return gate.status();
     });
 
     m.get('/api/public/departments', () =>

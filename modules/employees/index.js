@@ -5,6 +5,7 @@ const db = require('../../core/db');
 const cf = require('../../core/customfields');
 const notify = require('../../core/notify');
 const people = require('../../core/people');
+const pay = require('../../core/pay');
 const { HttpError, str, int, oneOf, date, bad, today, parseJson } = require('../../core/util');
 
 const STATUSES = ['active', 'inactive', 'resigned', 'terminated'];
@@ -138,8 +139,13 @@ module.exports = {
       ctx.assertDept(team.departmentId);
       const e = input(ctx, null);
       const pin = chosenPin(ctx.body.pin) || auth.generatePin();
-      const result = db.tx(() => people.createEmployee({ ...e, role: 'member', departmentId: team.departmentId, teamId: team.id, pin }, ctx.user.label));
-      ctx.audit('create', 'employee', result.id, `${e.name} (${result.empCode}) in ${team.name}`, team.departmentId);
+      const rate = pay.validate(ctx.body.pay); // how the member is paid: fixed, percentage or both (the screen asks for it)
+      const result = db.tx(() => {
+        const made = people.createEmployee({ ...e, role: 'member', departmentId: team.departmentId, teamId: team.id, pin }, ctx.user.label);
+        if (rate) pay.save(made.id, rate);
+        return made;
+      });
+      ctx.audit('create', 'employee', result.id, `${e.name} (${result.empCode}) in ${team.name}${rate ? `, paid: ${pay.describe(rate)}` : ''}`, team.departmentId);
       notify.toTeamLeader(team.id, { title: `New member in ${team.name}`, body: `${e.name} joined your team.`, link: '#/employees', kind: 'team' });
       return { ...result, pin }; // only the hash is stored; the PIN is shown once so it can be handed over
     });

@@ -1,9 +1,12 @@
 'use strict';
 const db = require('../../core/db');
 const notify = require('../../core/notify');
+const pay = require('../../core/pay');
+const { fxSql } = require('../../core/currency');
 const { HttpError, int, str, num, oneOf, date, today, bad, round } = require('../../core/util');
 
 /*
+ * How much is due: a fixed salary, a percentage of the net profit of the person's daily sheet (commission), or both (core/pay.js).
  * Salary payments. Everyone who works for eTricks is paid as a person (payee_type 'member' = an employee of any role):
  *   a team leader pays and tracks the members of their team,
  *   the head of department also tracks team leaders and members of the department,
@@ -32,6 +35,10 @@ function assertCanManage(ctx, payee) {
 
 const rateOf = (refId) => db.get('SELECT * FROM salary_rates WHERE payee_type=? AND ref_id=?', TYPE, refId);
 
+// The net profit each person's daily sheet shows for a month, in the company currency: the base of a percentage.
+const profitByPerson = (per) => Object.fromEntries(db.all(
+  `SELECT employee_id, COALESCE(SUM((revenue - investment) * ${fxSql('currency')}), 0) AS p FROM member_orders WHERE substr(date,1,7)=? GROUP BY employee_id`, per).map((r) => [r.employeeId, r.p]));
+
 function paymentsFor(recordIds) {
   if (!recordIds.length) return {};
   const rows = db.all(`SELECT * FROM salary_payments WHERE record_id IN (${recordIds.map(() => '?').join(',')}) ORDER BY paid_date DESC, id DESC`, ...recordIds);
@@ -40,8 +47,8 @@ function paymentsFor(recordIds) {
   return by;
 }
 
-function summarise(record, payments, rate) {
-  const due = record ? record.amountDue : rate?.amount || 0;
+function summarise(record, payments, suggested) {
+  const due = record ? record.amountDue : suggested || 0;
   const paid = round(payments.reduce((s, p) => s + p.amount, 0));
   const status = due <= 0 ? 'no_salary' : paid >= due - 0.005 ? 'paid' : paid > 0 ? 'partial' : 'unpaid';
   return {
@@ -87,6 +94,9 @@ module.exports = {
     // 2: the old "department leader" salaries (they had no person behind them) are kept apart, nothing is deleted
     `UPDATE salary_rates SET payee_type='legacy_leader' WHERE payee_type='leader';
      UPDATE salary_records SET payee_type='legacy_leader' WHERE payee_type='leader';`,
+    // 3: how a person is paid: a fixed salary, a percentage of the profit, or both (amount = the fixed part)
+    `ALTER TABLE salary_rates ADD COLUMN pay_type TEXT NOT NULL DEFAULT 'fixed';
+     ALTER TABLE salary_rates ADD COLUMN percent REAL NOT NULL DEFAULT 0;`,
   ],
 
   routes(m) {
@@ -117,15 +127,23 @@ module.exports = {
       const pays = paymentsFor(Object.values(records).map((r) => r.id));
       const rates = Object.fromEntries(db.all('SELECT * FROM salary_rates WHERE payee_type=?', TYPE).map((r) => [r.refId, r]));
 
+      const profits = profitByPerson(per);
       const rows = payees.map((p) => {
         const rec = records[p.refId];
-        return { ...p, rate: rates[p.refId]?.amount || 0, ...summarise(rec, rec ? pays[rec.id] || [] : [], rates[p.refId]) };
+        const rate = rates[p.refId];
+        const profit = round(profits[p.refId] || 0);
+        const calc = pay.compute(rate, profit);
+        return {
+          ...p, rate: rate?.amount || 0, payType: rate?.payType || 'fixed', percent: rate?.percent || 0, payText: pay.describe(rate), profit, commission: calc.commission, suggested: calc.due,
+          ...summarise(rec, rec ? pays[rec.id] || [] : [], calc.due),
+        };
       });
       if (q.format === 'csv') {
         return ctx.csv(`salaries-${per}.csv`, [
           { label: 'Month', value: () => per }, { label: 'Code', key: 'code' }, { label: 'Name', key: 'name' }, { label: 'Role', key: 'role' },
           { label: 'Department', key: 'departmentName' }, { label: 'Team', key: 'teamName' },
-          { label: 'Monthly salary', key: 'rate' }, { label: 'Due this month', key: 'due' }, { label: 'Paid', key: 'paid' }, { label: 'Remaining', key: 'remaining' },
+          { label: 'Paid how', key: 'payText' }, { label: 'Fixed salary', key: 'rate' }, { label: 'Percentage of profit', key: 'percent' }, { label: 'Profit this month', key: 'profit' }, { label: 'Commission this month', key: 'commission' },
+          { label: 'Due this month', key: 'due' }, { label: 'Paid', key: 'paid' }, { label: 'Remaining', key: 'remaining' },
           { label: 'Last paid on', key: 'lastPaidDate' }, { label: 'Status', key: 'status' },
           { label: 'Payments awaiting confirmation', key: 'pending' }, { label: 'Confirmed', key: 'confirmed' }, { label: 'Disputed', key: 'disputed' },
         ], rows);
@@ -144,19 +162,17 @@ module.exports = {
       assertCanManage(ctx, payee);
       const records = db.all('SELECT * FROM salary_records WHERE payee_type=? AND ref_id=? ORDER BY period DESC', TYPE, payee.refId);
       const pays = paymentsFor(records.map((r) => r.id));
-      return { payee, rate: rateOf(payee.refId)?.amount || 0, records: records.map((r) => ({ period: r.period, ...summarise(r, pays[r.id] || [], null) })) };
+      const rate = rateOf(payee.refId);
+      return { payee, rate: rate?.amount || 0, payType: rate?.payType || 'fixed', percent: rate?.percent || 0, payText: pay.describe(rate), records: records.map((r) => ({ period: r.period, ...summarise(r, pays[r.id] || [], null) })) };
     });
 
     m.put('/api/salaries/rate', { roles: lead }, (ctx) => {
       const payee = payeeInfo(int(ctx.body.refId, 'Person', { required: true }));
       if (!payee) throw new HttpError(404, 'Person not found');
       assertCanManage(ctx, payee);
-      const amount = num(ctx.body.amount, 'Monthly salary', { required: true, min: 0, max: 1e9 });
-      db.run(
-        `INSERT INTO salary_rates(payee_type, ref_id, amount, payee_name, updated_at) VALUES (?,?,?,?,?)
-         ON CONFLICT(payee_type, ref_id) DO UPDATE SET amount=excluded.amount, updated_at=excluded.updated_at`,
-        TYPE, payee.refId, amount, null, new Date().toISOString());
-      ctx.audit('salary_set', 'salary', payee.refId, `${payee.name}: monthly salary ${amount}`, payee.departmentId);
+      const rate = pay.validate(ctx.body, { required: true });
+      pay.save(payee.refId, rate);
+      ctx.audit('salary_set', 'salary', payee.refId, `${payee.name}: ${pay.describe(rate)}`, payee.departmentId);
       return { ok: true };
     });
 
@@ -175,8 +191,10 @@ module.exports = {
       const id = db.tx(() => {
         let rec = db.get('SELECT * FROM salary_records WHERE payee_type=? AND ref_id=? AND period=?', TYPE, payee.refId, per);
         const wantedDue = num(b.salaryAmount, 'Salary for the month', { min: 0.01, max: 1e9 });
-        const due = wantedDue ?? rec?.amountDue ?? rateOf(payee.refId)?.amount ?? 0;
-        if (due <= 0) throw bad('Set a monthly salary first');
+        const rate = rateOf(payee.refId);
+        const suggested = rate ? pay.compute(rate, profitByPerson(per)[payee.refId] || 0).due : 0;
+        const due = wantedDue ?? rec?.amountDue ?? suggested;
+        if (due <= 0) throw bad(rate && rate.payType !== 'fixed' ? 'Nothing is due for this month yet: the profit so far gives no percentage. Type the amount in "Salary for this month" to pay a specific amount' : 'Set how this person is paid first');
         const paidSoFar = rec ? db.get('SELECT COALESCE(SUM(amount),0) AS s FROM salary_payments WHERE record_id=?', rec.id).s : 0;
         if (paidSoFar + amount > due + 0.005) {
           throw bad(`This would make the total paid ${round(paidSoFar + amount)}, more than the salary of ${round(due)}. If it includes a bonus, raise "Salary for the month".`);
@@ -229,8 +247,13 @@ module.exports = {
       const records = db.all('SELECT * FROM salary_records WHERE payee_type=? AND ref_id=? ORDER BY period DESC LIMIT 24', TYPE, payee.refId);
       const pays = paymentsFor(records.map((r) => r.id));
       const months = records.map((r) => ({ period: r.period, ...summarise(r, pays[r.id] || [], null) }));
+      const rate = rateOf(payee.refId);
+      const profit = round(profitByPerson(thisMonth())[payee.refId] || 0);
+      const calc = pay.compute(rate, profit);
       return {
-        payee: { name: payee.name, departmentName: payee.departmentName }, monthlySalary: rateOf(payee.refId)?.amount || 0, months,
+        payee: { name: payee.name, departmentName: payee.departmentName }, monthlySalary: rate?.amount || 0, months,
+        payType: rate?.payType || 'fixed', percent: rate?.percent || 0, payText: pay.describe(rate),
+        thisMonth: { period: thisMonth(), profit, commission: calc.commission, due: calc.due },
         awaitingConfirmation: months.reduce((s, x) => s + x.pending, 0),
       };
     });

@@ -7,18 +7,23 @@ const { converter, rates, CURRENCIES } = require('../../core/currency');
 const { HttpError, int, str, num, date, oneOf, range, today, addDays, bad, round, parseJson } = require('../../core/util');
 
 /*
- * Daily reports from each team member, kept as a sheet: one row per report with the market, store, client, currency, orders
- * received, purchasing cost, total sales and notes, plus up to MAX_COLUMNS columns of the member's own.
+ * The daily sheet of each team member. One row per order, with these permanent columns:
+ *   SR#, Date, Order Id, Customer Details, Qty, Supplier Order No, You Earned, Ali Exp Price, Net Profit, ROI %, Comments, Refunds,
+ *   Note about orders   (+ Currency: AUD, USD or GBP)
+ * and, for the team only, Market and Store. Net Profit and ROI % are worked out. On top of these the member can add up to
+ * MAX_COLUMNS columns of their own and decide for each whether the client sees it.
  *
- *   - A team leader sees their team, the head of department all teams of the department, the admin everyone. The same rows
- *     are the figures behind the reports and dashboards (converted to the company currency with the rates in Settings).
- *   - The member edits the sheet freely (leaders, heads and the admin see it live). The client sees it only when the member
- *     presses "Update client": that sends a copy of the sheet exactly as it is (every column, every row, notes too) for the
- *     period on screen. Rows tagged with another client are left out. The client never learns who wrote it.
- *   - These figures are NOT added to the department Finance page automatically (avoids double counting).
+ *   - Qty, You Earned and Ali Exp Price are the fields the reports have always used (orders, total sales, purchasing cost), so
+ *     every report and dashboard keeps working; amounts of other currencies are converted with the rates in Settings.
+ *   - A member who works for clients has ONE SHEET PER CLIENT (rows and columns of one never touch another's). A member
+ *     without a client has one general sheet.
+ *   - The member edits freely; leaders, heads and the admin see it live. The client sees a copy only when the member presses
+ *     "Update client": the whole sheet of that client, the permanent columns and the columns marked for the client. The client
+ *     never learns who wrote it. The client's Sales page (today, daily, monthly, total) is worked out from these copies.
  */
 const MAX_COLUMNS = 6;
 const EDIT_DAYS = 7;
+const MAX_SHEET_ROWS = 2000;
 
 const SELECT = `
   SELECT o.*, (o.revenue - o.investment) AS profit, e.name AS employee_name, e.emp_code, e.team_id, e.role AS employee_role,
@@ -29,7 +34,8 @@ const SELECT = `
     LEFT JOIN teams t ON t.id=e.team_id
     LEFT JOIN clients cl ON cl.id=o.client_id`;
 
-const shape = (r) => ({ ...r, extra: parseJson(r.extra, {}) });
+const roiOf = (investment, profit) => (investment > 0 ? round((profit / investment) * 100) : null);
+const shape = (r) => ({ ...r, extra: parseJson(r.extra, {}), roi: roiOf(r.investment, r.revenue - r.investment) });
 
 // Totals in the company currency (converted row by row) and, next to them, the plain totals of each currency.
 const totals = (rows) => {
@@ -45,6 +51,35 @@ const totals = (rows) => {
     orders, investment: round(investment), revenue: round(revenue), profit: round(revenue - investment), entries: rows.length,
     byCurrency: Object.fromEntries(Object.entries(by).map(([c, t]) => [c, { orders: t.orders, investment: round(t.investment), revenue: round(t.revenue), profit: round(t.revenue - t.investment) }])),
   };
+};
+
+// The client's Sales page: today, every day, every month and the total, for each currency, from the copies of the sheets sent to it.
+const salesFromCopies = (clientId) => {
+  const rows = db.all('SELECT data FROM sheet_publications WHERE client_id=?', clientId).flatMap((p) => parseJson(p.data, { rows: [] }).rows || []);
+  const day = today();
+  const month = day.slice(0, 7);
+  const zero = () => ({ qty: 0, investment: 0, sales: 0, profit: 0 });
+  const add = (t, r) => { t.qty += r.orders; t.investment += r.investment; t.sales += r.revenue; t.profit += r.revenue - r.investment; };
+  const fix = (t) => ({ qty: t.qty, investment: round(t.investment), sales: round(t.sales), profit: round(t.sales - t.investment) });
+  const by = {};
+  for (const r of rows) {
+    const c = (by[r.currency] ||= { today: zero(), month: zero(), total: zero(), days: new Map(), months: new Map(), first: r.date });
+    add(c.total, r);
+    if (r.date === day) add(c.today, r);
+    if (r.date.slice(0, 7) === month) add(c.month, r);
+    if (!c.days.has(r.date)) c.days.set(r.date, zero());
+    add(c.days.get(r.date), r);
+    const mo = r.date.slice(0, 7);
+    if (!c.months.has(mo)) c.months.set(mo, zero());
+    add(c.months.get(mo), r);
+    if (r.date < c.first) c.first = r.date;
+  }
+  return Object.entries(by).map(([currency, c]) => ({
+    currency, today: fix(c.today), month: fix(c.month), total: { ...fix(c.total), since: c.first, days: c.days.size },
+    days: [...c.days].sort((a, b) => b[0].localeCompare(a[0])).map(([d, t]) => ({ date: d, ...fix(t) })),
+    months: [...c.months].sort((a, b) => b[0].localeCompare(a[0])).map(([m, t]) => ({ month: m, ...fix(t) })),
+    chart: Array.from({ length: 14 }, (_, i) => { const d = addDays(day, i - 13); return { date: d, sales: round(c.days.get(d)?.sales || 0) }; }),
+  })).sort((a, b) => b.total.sales - a.total.sales);
 };
 
 module.exports = {
@@ -77,20 +112,51 @@ module.exports = {
        from_date TEXT NOT NULL, to_date TEXT NOT NULL, data TEXT NOT NULL, hash TEXT NOT NULL, row_count INTEGER NOT NULL DEFAULT 0,
        published_at TEXT NOT NULL, UNIQUE (client_id, employee_id));
      CREATE INDEX idx_pub_client ON sheet_publications(client_id);`,
+    // 5: the permanent columns of the sheet, and the sheet of one client (client_id of a column = the sheet it belongs to; empty = the general sheet)
+    `ALTER TABLE member_orders ADD COLUMN order_id TEXT;
+     ALTER TABLE member_orders ADD COLUMN customer TEXT;
+     ALTER TABLE member_orders ADD COLUMN supplier_order_no TEXT;
+     ALTER TABLE member_orders ADD COLUMN comments TEXT;
+     ALTER TABLE member_orders ADD COLUMN refunds TEXT;
+     ALTER TABLE order_columns ADD COLUMN client_id INTEGER;`,
+    // 6: what a client was sent stays with the client when the person who wrote it leaves (employee_id becomes empty)
+    `CREATE TABLE sheet_publications_new (
+       id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL, employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+       from_date TEXT NOT NULL, to_date TEXT NOT NULL, data TEXT NOT NULL, hash TEXT NOT NULL, row_count INTEGER NOT NULL DEFAULT 0,
+       published_at TEXT NOT NULL, UNIQUE (client_id, employee_id));
+     INSERT INTO sheet_publications_new SELECT id, client_id, employee_id, from_date, to_date, data, hash, row_count, published_at FROM sheet_publications;
+     DROP TABLE sheet_publications;
+     ALTER TABLE sheet_publications_new RENAME TO sheet_publications;
+     CREATE INDEX idx_pub_client ON sheet_publications(client_id);`,
   ],
 
   routes(m) {
     const lead = ['admin', 'hod', 'leader'];
     const self = ['leader', 'member'];
 
-    const myColumns = (employeeId) => db.all('SELECT id, label, kind, client_visible, position FROM order_columns WHERE employee_id=? ORDER BY position, id', employeeId)
+    // The columns of one sheet (a client's sheet, or the general sheet when clientId is null).
+    const sheetColumns = (employeeId, clientId) => db.all(
+      'SELECT id, label, kind, client_visible, position FROM order_columns WHERE employee_id=? AND client_id IS ? ORDER BY position, id', employeeId, clientId ?? null)
       .map((c) => ({ id: c.id, label: c.label, kind: c.kind, clientVisible: !!c.clientVisible }));
-    // The clients a person may tag a row with: the ones the admin chose them for.
-    const myClients = (ctx) => db.all(
+    // The clients a person works for (the admin chose them): each is a sheet of its own.
+    const clientsOf = (employeeId, departmentId) => db.all(
       `SELECT c.id, c.username FROM client_staff s JOIN clients c ON c.id=s.client_id
-        WHERE s.employee_id=? AND c.status='active' AND c.department_id=? ORDER BY c.username`, ctx.user.employeeId, ctx.user.departmentId);
+        WHERE s.employee_id=? AND c.status='active' AND c.department_id=? ORDER BY c.username`, employeeId, departmentId);
+    const myClients = (ctx) => clientsOf(ctx.user.employeeId, ctx.user.departmentId);
 
-    // Validates a row. `old` is the stored row when editing: fields that are not sent keep their value.
+    // Which sheet something belongs to. With exactly one client that is simply the sheet; with several the screen says which.
+    const sheetClient = (ctx, requested) => {
+      const mine = myClients(ctx);
+      const cid = int(requested ?? null, 'Client');
+      if (cid == null) {
+        if (mine.length > 1) throw bad("Choose which client's sheet this is for");
+        return mine[0]?.id ?? null;
+      }
+      if (!mine.some((c) => c.id === cid)) throw bad('You can only use the sheet of a client you work for');
+      return cid;
+    };
+
+    // Validates a row. `old` is the stored row when editing: fields that are not sent keep their value, and the row stays on its sheet.
     const input = (b, ctx, old) => {
       const pick = (k, keep) => (b[k] === undefined ? keep : b[k]);
       const day = date(pick('date', old?.date), 'Date', { required: true });
@@ -98,17 +164,17 @@ module.exports = {
       if (day < addDays(today(), -31)) throw bad('You can only report orders from the last 31 days');
       const e = {
         date: day, market: str(pick('market', old?.market), 'Market', { max: 100 }), store: str(pick('store', old?.store), 'Store name', { max: 100 }),
-        orders: int(pick('orders', old?.orders) ?? 0, 'Orders', { min: 0, max: 1e6 }),
-        investment: num(pick('investment', old?.investment) ?? 0, 'Purchasing cost', { min: 0, max: 1e9 }), revenue: num(pick('revenue', old?.revenue) ?? 0, 'Total sales', { min: 0, max: 1e9 }),
-        note: str(pick('note', old?.note), 'Notes / activities', { max: 1000 }),
+        orderId: str(pick('orderId', old?.orderId), 'Order Id', { max: 60 }), customer: str(pick('customer', old?.customer), 'Customer details', { max: 300 }),
+        supplierOrderNo: str(pick('supplierOrderNo', old?.supplierOrderNo), 'Supplier order no', { max: 60 }),
+        orders: int(pick('orders', old?.orders) ?? 0, 'Qty', { min: 0, max: 1e6 }),
+        investment: num(pick('investment', old?.investment) ?? 0, 'Ali Exp price', { min: 0, max: 1e9 }), revenue: num(pick('revenue', old?.revenue) ?? 0, 'You earned', { min: 0, max: 1e9 }),
+        comments: str(pick('comments', old?.comments), 'Comments', { max: 500 }), refunds: str(pick('refunds', old?.refunds), 'Refunds', { max: 100 }),
+        note: str(pick('note', old?.note), 'Note about orders', { max: 1000 }),
         currency: oneOf(pick('currency', old?.currency) || 'USD', 'Currency', CURRENCIES),
       };
-      // the client this row is shared with: only one of the person's own clients (an old tag may stay as it is)
-      const cid = int(pick('clientId', old?.clientId) ?? null, 'Client');
-      if (cid != null && cid !== (old?.clientId ?? null) && !myClients(ctx).some((c) => c.id === cid)) throw bad('You can only share a report with a client you work for');
-      e.clientId = cid;
-      // the member's own columns
-      const cols = new Map(myColumns(ctx.user.employeeId).map((c) => [String(c.id), c]));
+      e.clientId = old ? old.clientId ?? null : sheetClient(ctx, b.clientId);
+      // the member's own columns of that sheet
+      const cols = new Map(sheetColumns(ctx.user.employeeId, e.clientId).map((c) => [String(c.id), c]));
       const raw = b.extra === undefined ? parseJson(old?.extra, {}) : b.extra;
       if (raw && (typeof raw !== 'object' || Array.isArray(raw))) throw bad('Extra columns are invalid');
       const extra = {};
@@ -118,63 +184,90 @@ module.exports = {
         extra[k] = col.kind === 'number' ? num(v, col.label, { min: -1e9, max: 1e9 }) : str(v, col.label, { max: 200 });
       }
       e.extra = Object.keys(extra).length ? JSON.stringify(extra) : null;
-      if (!e.orders && !e.investment && !e.revenue && !e.note && !e.market && !e.store && !e.extra) throw bad('Enter at least orders, purchasing cost, total sales, a note or a market / store');
+      if (!e.orders && !e.investment && !e.revenue && !e.note && !e.market && !e.store && !e.orderId && !e.customer && !e.supplierOrderNo && !e.comments && !e.refunds && !e.extra) {
+        throw bad('Fill in at least one cell of the row');
+      }
       return e;
     };
-    const auditText = (e) => `${e.date}: ${e.orders} orders, total sales ${e.revenue} ${e.currency}, purchasing cost ${e.investment}`;
+    const auditText = (e) => `${e.date}: ${e.orders} qty, earned ${e.revenue} ${e.currency}, price ${e.investment}`;
 
-    // ---- members and team leaders write their own daily report ----
-    // The admin and the head of department see the leaders' reports; a leader sees only the reports of their team's members.
-    const sheetOf = (employeeId, from, to) => db.all(`${SELECT} WHERE o.employee_id=? AND o.date BETWEEN ? AND ? ORDER BY o.date DESC, o.id DESC LIMIT 2000`, employeeId, from, to).map(shape);
-    // What a client would see right now: every row of the period that is not tagged for another client, and every column.
-    const snapshotFor = (employeeId, clientId, from, to) => {
-      const rows = db.all(`${SELECT} WHERE o.employee_id=? AND o.date BETWEEN ? AND ? AND (o.client_id IS NULL OR o.client_id=?) ORDER BY o.date, o.id LIMIT 2000`, employeeId, from, to, clientId).map(shape);
+    // ---- the sheet of one person ----
+    const sheetOf = (employeeId, clientId, from, to) => db.all(
+      `${SELECT} WHERE o.employee_id=? AND o.client_id IS ? AND o.date BETWEEN ? AND ? ORDER BY o.date DESC, o.id DESC LIMIT ${MAX_SHEET_ROWS}`, employeeId, clientId ?? null, from, to).map(shape);
+
+    // What a client would see right now: the whole sheet of that client (newest MAX_SHEET_ROWS rows), the permanent columns and
+    // the columns of the sheet marked for the client.
+    const snapshotFor = (employeeId, clientId) => {
+      const rows = db.all(`${SELECT} WHERE o.employee_id=? AND o.client_id=? ORDER BY o.date DESC, o.id DESC LIMIT ${MAX_SHEET_ROWS}`, employeeId, clientId).map(shape).reverse();
+      const visible = sheetColumns(employeeId, clientId).filter((c) => c.clientVisible);
+      const ids = new Set(visible.map((c) => String(c.id)));
       const data = {
-        columns: myColumns(employeeId).map((c) => ({ id: c.id, label: c.label, kind: c.kind })),
+        columns: visible.map((c) => ({ id: c.id, label: c.label, kind: c.kind })),
         rows: rows.map((r) => ({
-          date: r.date, market: r.market, store: r.store, currency: r.currency, orders: r.orders, investment: r.investment, revenue: r.revenue,
-          profit: round(r.revenue - r.investment), note: r.note, extra: r.extra,
+          date: r.date, orderId: r.orderId, customer: r.customer, orders: r.orders, supplierOrderNo: r.supplierOrderNo, currency: r.currency, revenue: r.revenue, investment: r.investment,
+          profit: round(r.revenue - r.investment), roi: r.roi, comments: r.comments, refunds: r.refunds, note: r.note,
+          extra: Object.fromEntries(Object.entries(r.extra).filter(([k]) => ids.has(k))),
         })),
       };
       return { data, hash: crypto.createHash('sha256').update(JSON.stringify(data)).digest('hex').slice(0, 24) };
     };
     // The copies this person has sent, and whether each is still the same as the sheet now.
     const publicationsOf = (employeeId) => db.all(
-      `SELECT p.client_id, p.from_date, p.to_date, p.hash, p.row_count, p.published_at, c.username FROM sheet_publications p JOIN clients c ON c.id=p.client_id WHERE p.employee_id=? ORDER BY p.id`, employeeId)
-      .map((p) => ({ clientId: p.clientId, username: p.username, publishedAt: p.publishedAt, from: p.fromDate, to: p.toDate, rows: p.rowCount, upToDate: snapshotFor(employeeId, p.clientId, p.fromDate, p.toDate).hash === p.hash }));
+      `SELECT p.client_id, p.hash, p.row_count, p.published_at, c.username FROM sheet_publications p JOIN clients c ON c.id=p.client_id WHERE p.employee_id=? ORDER BY p.id`, employeeId)
+      .map((p) => ({ clientId: p.clientId, username: p.username, publishedAt: p.publishedAt, rows: p.rowCount, upToDate: snapshotFor(employeeId, p.clientId).hash === p.hash }));
 
     const csvColumns = [
-      { label: 'Date', key: 'date' }, { label: 'Market', key: 'market' }, { label: 'Store name', key: 'store' }, { label: 'Client', key: 'clientUsername' }, { label: 'Currency', key: 'currency' },
-      { label: 'Orders received', key: 'orders' }, { label: 'Purchasing cost', key: 'investment' }, { label: 'Total sales', key: 'revenue' }, { label: 'Profit', value: (r) => round(r.profit) },
-      { label: 'Notes / activities', key: 'note' },
+      { label: 'SR#', key: 'sr' }, { label: 'Date', key: 'date' }, { label: 'Order Id', key: 'orderId' }, { label: 'Customer Details', key: 'customer' }, { label: 'Qty', key: 'orders' },
+      { label: 'Supplier Order No', key: 'supplierOrderNo' }, { label: 'Currency', key: 'currency' }, { label: 'You Earned', key: 'revenue' }, { label: 'Ali Exp Price', key: 'investment' },
+      { label: 'Net Profit', value: (r) => round(r.profit) }, { label: 'ROI %', key: 'roi' }, { label: 'Comments', key: 'comments' }, { label: 'Refunds', key: 'refunds' },
+      { label: 'Note about orders', key: 'note' }, { label: 'Market', key: 'market' }, { label: 'Store', key: 'store' },
     ];
+
+    // Which sheets a person has: one per client they work for, and the general sheet when they have no client or rows without one.
+    const sheetTabs = (employeeId, departmentId) => {
+      const clients = clientsOf(employeeId, departmentId);
+      const general = clients.length === 0 || db.get('SELECT 1 AS x FROM member_orders WHERE employee_id=? AND client_id IS NULL LIMIT 1', employeeId)
+        || db.get('SELECT 1 AS x FROM order_columns WHERE employee_id=? AND client_id IS NULL LIMIT 1', employeeId);
+      return { clients, hasGeneral: !!general };
+    };
+    // The sheet asked for: "general", a client's id, or (nothing asked) the first one.
+    const pickSheet = (tabs, asked) => {
+      if (asked === 'general') return null;
+      if (asked === undefined || asked === '') return tabs.clients[0]?.id ?? null;
+      const id = int(asked, 'Sheet');
+      if (!tabs.clients.some((c) => c.id === id)) throw bad('That is not one of your clients');
+      return id;
+    };
 
     m.get('/api/orders/me', { roles: self }, (ctx) => {
       const { from, to } = range(ctx.query);
-      const rows = sheetOf(ctx.user.employeeId, from, to);
-      if (ctx.query.format === 'csv') return ctx.csv('my-daily-reports.csv', csvColumns, rows);
-      return { rows, totals: totals(rows), columns: myColumns(ctx.user.employeeId), clients: myClients(ctx), fx: rates(), currencies: CURRENCIES, editDays: EDIT_DAYS, published: publicationsOf(ctx.user.employeeId) };
+      const tabs = sheetTabs(ctx.user.employeeId, ctx.user.departmentId);
+      const clientId = pickSheet(tabs, ctx.query.client);
+      const rows = sheetOf(ctx.user.employeeId, clientId, from, to);
+      if (ctx.query.format === 'csv') return ctx.csv('my-daily-sheet.csv', csvColumns, [...rows].reverse().map((r, i) => ({ ...r, sr: i + 1 })));
+      return {
+        rows, totals: totals(rows), clientId, columns: sheetColumns(ctx.user.employeeId, clientId), clients: tabs.clients, hasGeneral: tabs.hasGeneral,
+        totalRows: db.get('SELECT COUNT(*) AS n FROM member_orders WHERE employee_id=? AND client_id IS ?', ctx.user.employeeId, clientId).n, // the whole sheet, whatever dates are on screen
+        fx: rates(), currencies: CURRENCIES, editDays: EDIT_DAYS, published: publicationsOf(ctx.user.employeeId),
+      };
     });
 
-    // "Update client": send the client a copy of the sheet as it is now.
+    // "Update client": send the client a copy of this sheet as it is now.
     m.post('/api/orders/publish', { roles: self }, (ctx) => {
       const clientId = int(ctx.body.clientId, 'Client', { required: true });
       const client = myClients(ctx).find((c) => c.id === clientId);
       if (!client) throw bad('You can only update a client you work for');
-      const from = date(ctx.body.from, 'From', { required: true });
-      const to = date(ctx.body.to, 'To', { required: true });
-      if (from > to) throw bad('"To" cannot be before "From"');
-      if (from < addDays(to, -366)) throw bad('Send up to one year at a time');
-      const { data, hash } = snapshotFor(ctx.user.employeeId, clientId, from, to);
-      if (!data.rows.length) throw bad('Nothing to send: your sheet has no rows in this period');
+      const { data, hash } = snapshotFor(ctx.user.employeeId, clientId);
+      if (!data.rows.length) throw bad('Nothing to send: this sheet has no rows yet');
       const now = new Date().toISOString();
+      const dates = data.rows.map((r) => r.date);
       db.run(
         `INSERT INTO sheet_publications(client_id, employee_id, from_date, to_date, data, hash, row_count, published_at) VALUES (?,?,?,?,?,?,?,?)
          ON CONFLICT(client_id, employee_id) DO UPDATE SET from_date=excluded.from_date, to_date=excluded.to_date, data=excluded.data, hash=excluded.hash, row_count=excluded.row_count, published_at=excluded.published_at`,
-        clientId, ctx.user.employeeId, from, to, JSON.stringify(data), hash, data.rows.length, now);
-      ctx.audit('sheet_published', 'orders', clientId, `${client.username}: ${data.rows.length} rows, ${from} to ${to}`); // never the figures
+        clientId, ctx.user.employeeId, dates.reduce((a, b) => (a < b ? a : b)), dates.reduce((a, b) => (a > b ? a : b)), JSON.stringify(data), hash, data.rows.length, now);
+      ctx.audit('sheet_published', 'orders', clientId, `${client.username}: ${data.rows.length} rows`); // never the figures
       notify.send({ clientId }, { title: 'Your sheet was updated', body: 'Open the Daily Sheet page of your portal.', link: '#/portal-sheet', kind: 'sheet' });
-      return { clientId, username: client.username, publishedAt: now, rows: data.rows.length, from, to, upToDate: true };
+      return { clientId, username: client.username, publishedAt: now, rows: data.rows.length, upToDate: true };
     });
 
     // Stop showing the sheet to a client.
@@ -209,44 +302,47 @@ module.exports = {
     m.del('/api/orders/:id', { roles: self }, (ctx) => {
       const o = own(ctx);
       db.run('DELETE FROM member_orders WHERE id=?', o.id);
-      ctx.audit('orders_deleted', 'orders', o.id, `${o.date}: ${o.orders} orders`);
+      ctx.audit('orders_deleted', 'orders', o.id, `${o.date}: ${o.orders} qty`);
       return { ok: true };
     });
 
-    // ---- the member's own columns ----
+    // ---- the member's own columns (of one client's sheet) ----
     const columnInput = (b) => ({
       label: str(b.label, 'Column name', { required: true, max: 30 }),
       kind: oneOf(b.kind || 'text', 'Type', ['text', 'number']),
-      clientVisible: b.clientVisible ? 1 : 0,
+      clientVisible: b.clientVisible ? 1 : 0, // does the client see this column? (the permanent columns are always shown to the client)
     });
     const ownColumn = (ctx) => {
       const c = db.get('SELECT * FROM order_columns WHERE id=? AND employee_id=?', int(ctx.params.id, 'Column', { required: true }), ctx.user.employeeId);
       if (!c) throw new HttpError(404, 'Column not found');
       return c;
     };
-    const sameLabel = (employeeId, label, exceptId) => db.get('SELECT 1 AS x FROM order_columns WHERE employee_id=? AND lower(label)=lower(?) AND id<>?', employeeId, label, exceptId ?? 0);
-    const RESERVED = ['date', 'market', 'store', 'store name', 'client', 'currency', 'orders', 'orders received', 'purchasing cost', 'total sales', 'profit', 'notes', 'notes / activities'];
+    const sameLabel = (employeeId, clientId, label, exceptId) => db.get('SELECT 1 AS x FROM order_columns WHERE employee_id=? AND client_id IS ? AND lower(label)=lower(?) AND id<>?', employeeId, clientId ?? null, label, exceptId ?? 0);
+    const RESERVED = ['sr#', 'sr', 'date', 'order id', 'customer details', 'qty', 'supplier order no', 'currency', 'you earned', 'ali exp price', 'net profit', 'roi %', 'roi', 'comments', 'refunds', 'note about orders',
+      'market', 'store', 'store name', 'client', 'orders', 'orders received', 'purchasing cost', 'total sales', 'profit', 'notes', 'notes / activities'];
 
     m.post('/api/orders/columns', { roles: self }, (ctx) => {
       const c = columnInput(ctx.body);
-      if (RESERVED.includes(c.label.toLowerCase()) || sameLabel(ctx.user.employeeId, c.label)) throw bad('You already have a column with that name');
-      if (db.get('SELECT COUNT(*) AS n FROM order_columns WHERE employee_id=?', ctx.user.employeeId).n >= MAX_COLUMNS) throw bad(`You can add up to ${MAX_COLUMNS} columns of your own`);
-      const pos = (db.get('SELECT COALESCE(MAX(position),0)+1 AS p FROM order_columns WHERE employee_id=?', ctx.user.employeeId).p);
-      const r = db.insert('order_columns', { employeeId: ctx.user.employeeId, label: c.label, kind: c.kind, clientVisible: c.clientVisible, position: pos, createdAt: new Date().toISOString() });
-      ctx.audit('orders_column_added', 'orders', r.id, c.label);
+      const clientId = sheetClient(ctx, ctx.body.clientId);
+      if (RESERVED.includes(c.label.toLowerCase()) || sameLabel(ctx.user.employeeId, clientId, c.label)) throw bad('This sheet already has a column with that name');
+      if (db.get('SELECT COUNT(*) AS n FROM order_columns WHERE employee_id=? AND client_id IS ?', ctx.user.employeeId, clientId).n >= MAX_COLUMNS) throw bad(`A sheet can have up to ${MAX_COLUMNS} columns of your own`);
+      const pos = db.get('SELECT COALESCE(MAX(position),0)+1 AS p FROM order_columns WHERE employee_id=? AND client_id IS ?', ctx.user.employeeId, clientId).p;
+      const r = db.insert('order_columns', { employeeId: ctx.user.employeeId, clientId, label: c.label, kind: c.kind, clientVisible: c.clientVisible, position: pos, createdAt: new Date().toISOString() });
+      ctx.audit('orders_column_added', 'orders', r.id, `${c.label}${c.clientVisible ? ' (shown to the client)' : ''}`);
       return { id: r.id };
     });
     m.put('/api/orders/columns/:id', { roles: self }, (ctx) => {
       const col = ownColumn(ctx);
       const c = columnInput({ kind: col.kind, ...ctx.body }); // the type of a column with data cannot change
-      if (RESERVED.includes(c.label.toLowerCase()) || sameLabel(ctx.user.employeeId, c.label, col.id)) throw bad('You already have a column with that name');
+      if (RESERVED.includes(c.label.toLowerCase()) || sameLabel(ctx.user.employeeId, col.clientId, c.label, col.id)) throw bad('This sheet already has a column with that name');
       db.update('order_columns', col.id, { label: c.label, clientVisible: c.clientVisible });
+      ctx.audit('orders_column_edited', 'orders', col.id, `${c.label}${c.clientVisible ? ' (shown to the client)' : ' (hidden from the client)'}`);
       return { ok: true };
     });
     m.del('/api/orders/columns/:id', { roles: self }, (ctx) => {
       const col = ownColumn(ctx);
       db.tx(() => {
-        for (const r of db.all("SELECT id, extra FROM member_orders WHERE employee_id=? AND extra IS NOT NULL", ctx.user.employeeId)) {
+        for (const r of db.all('SELECT id, extra FROM member_orders WHERE employee_id=? AND client_id IS ? AND extra IS NOT NULL', ctx.user.employeeId, col.clientId ?? null)) {
           const x = parseJson(r.extra, {});
           if (String(col.id) in x) { delete x[col.id]; db.run('UPDATE member_orders SET extra=? WHERE id=?', Object.keys(x).length ? JSON.stringify(x) : null, r.id); }
         }
@@ -265,15 +361,16 @@ module.exports = {
       const search = q.search ? `%${q.search}%` : null;
       const rows = db.all(
         `${SELECT} WHERE instr(?, ',' || e.role || ',') > 0 AND o.date BETWEEN ? AND ? AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR o.employee_id=?)
-            AND (? IS NULL OR e.team_id=?) AND (? IS NULL OR e.name LIKE ? OR e.emp_code LIKE ? OR o.store LIKE ? OR o.market LIKE ? OR cl.username LIKE ?)
+            AND (? IS NULL OR e.team_id=?) AND (? IS NULL OR e.name LIKE ? OR e.emp_code LIKE ? OR o.store LIKE ? OR o.market LIKE ? OR cl.username LIKE ? OR o.order_id LIKE ? OR o.customer LIKE ?)
           ORDER BY o.date DESC, e.name LIMIT 3000`,
-        ctx.rolesCsv(), from, to, dept, dept, q.employeeId || null, q.employeeId || null, team, team, search, search, search, search, search, search).map(shape);
+        ctx.rolesCsv(), from, to, dept, dept, q.employeeId || null, q.employeeId || null, team, team, search, search, search, search, search, search, search, search).map(shape);
       if (q.format === 'csv') {
         return ctx.csv('member-orders.csv', [
           { label: 'Date', key: 'date' }, { label: 'Code', key: 'empCode' }, { label: 'Employee', key: 'employeeName' }, { label: 'Role', key: 'employeeRole' }, { label: 'Department', key: 'departmentName' },
-          { label: 'Team', key: 'teamName' }, { label: 'Market', key: 'market' }, { label: 'Store name', key: 'store' }, { label: 'Client', key: 'clientUsername' }, { label: 'Currency', key: 'currency' },
-          { label: 'Orders received', key: 'orders' }, { label: 'Purchasing cost', key: 'investment' },
-          { label: 'Total sales', key: 'revenue' }, { label: 'Profit', value: (r) => round(r.profit) }, { label: 'Notes / activities', key: 'note' },
+          { label: 'Team', key: 'teamName' }, { label: 'Client', key: 'clientUsername' }, { label: 'Order Id', key: 'orderId' }, { label: 'Customer Details', key: 'customer' }, { label: 'Qty', key: 'orders' },
+          { label: 'Supplier Order No', key: 'supplierOrderNo' }, { label: 'Currency', key: 'currency' }, { label: 'You Earned', key: 'revenue' }, { label: 'Ali Exp Price', key: 'investment' },
+          { label: 'Net Profit', value: (r) => round(r.profit) }, { label: 'ROI %', key: 'roi' }, { label: 'Comments', key: 'comments' }, { label: 'Refunds', key: 'refunds' },
+          { label: 'Note about orders', key: 'note' }, { label: 'Market', key: 'market' }, { label: 'Store', key: 'store' },
         ], rows);
       }
       const by = {};
@@ -286,16 +383,26 @@ module.exports = {
       return { rows, totals: totals(rows), byEmployee, byTeam, fx: rates() };
     });
 
-    // One person's whole sheet (their own columns too), for the people above them. Read only.
+    // One person's sheets (their own columns too), for the people above them. Read only. ?client= picks a client's sheet or "general".
     m.get('/api/orders/sheet/:employeeId', { roles: lead }, (ctx) => {
       const emp = loadEmployee(int(ctx.params.employeeId, 'Person', { required: true }));
       if (!emp) throw new HttpError(404, 'Person not found');
       ctx.assertSee(emp);
       if (emp.role === 'hod') throw new HttpError(403, 'You cannot open this person');
       const { from, to } = range(ctx.query);
-      const rows = sheetOf(emp.id, from, to);
+      const tabs = sheetTabs(emp.id, emp.departmentId);
+      const counts = Object.fromEntries(db.all('SELECT client_id, COUNT(*) AS n FROM member_orders WHERE employee_id=? AND date BETWEEN ? AND ? GROUP BY client_id', emp.id, from, to).map((r) => [r.clientId ?? 'general', r.n]));
+      // the sheet to open: the one asked for, else the first that has rows
+      let clientId;
+      if (ctx.query.client === undefined || ctx.query.client === '') clientId = tabs.clients.find((c) => counts[c.id])?.id ?? (counts.general ? null : tabs.clients[0]?.id ?? null);
+      else clientId = pickSheet(tabs, ctx.query.client);
+      const rows = sheetOf(emp.id, clientId, from, to);
       const team = emp.teamId ? db.get('SELECT name FROM teams WHERE id=?', emp.teamId)?.name : null;
-      return { person: { id: emp.id, name: emp.name, empCode: emp.empCode, role: emp.role, teamName: team }, rows, totals: totals(rows), columns: myColumns(emp.id), fx: rates(), from, to, published: publicationsOf(emp.id) };
+      return {
+        person: { id: emp.id, name: emp.name, empCode: emp.empCode, role: emp.role, teamName: team }, rows, totals: totals(rows), clientId, columns: sheetColumns(emp.id, clientId),
+        sheets: [...tabs.clients.map((c) => ({ clientId: c.id, username: c.username, rows: counts[c.id] || 0 })), ...(tabs.hasGeneral ? [{ clientId: null, username: null, rows: counts.general || 0 }] : [])],
+        fx: rates(), from, to, published: publicationsOf(emp.id),
+      };
     });
 
     // ---- the client's view: the copies of the sheet the team sent, exactly as sent ----
@@ -312,5 +419,12 @@ module.exports = {
     m.get('/api/portal/sheet/stamp', { roles: ['client'] }, (ctx) => ({
       stamp: db.all('SELECT id, published_at FROM sheet_publications WHERE client_id=? ORDER BY id', ctx.user.clientId).map((p) => `${p.id}:${p.publishedAt}`).join('|'),
     }));
+    // The Sales page of the client: today, every day, every month and the total, from the sheets the team sent.
+    m.get('/api/portal/sales', { roles: ['client'] }, (ctx) => {
+      const info = db.get('SELECT c.username, d.name AS department_name FROM clients c JOIN departments d ON d.id=c.department_id WHERE c.id=?', ctx.user.clientId);
+      const updatedAt = db.get('SELECT MAX(published_at) AS t FROM sheet_publications WHERE client_id=?', ctx.user.clientId)?.t ?? null;
+      return { username: info?.username ?? null, departmentName: info?.departmentName ?? null, date: today(), updatedAt, currencies: salesFromCopies(ctx.user.clientId) };
+    });
   },
+  salesFromCopies,
 };

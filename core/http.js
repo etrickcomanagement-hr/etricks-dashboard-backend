@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const config = require('./config');
 const auth = require('./auth');
+const gate = require('./gate');
 const audit = require('./audit');
 const scope = require('./scope');
 const { HttpError, toCsv } = require('./util');
@@ -115,6 +116,8 @@ async function handleApi(req, res, url) {
     if (!user) throw new HttpError(401, 'Please sign in');
     if (!route.opts.roles.includes(user.role)) throw new HttpError(403, 'You do not have access to this');
   }
+  // The website access password: without it nothing that needs no sign-in (the department list, every login) answers.
+  if (!route.opts.roles && !user && !gate.OPEN.has(url.pathname) && !gate.passed(req)) throw new HttpError(403, 'Access password required');
   if (req.method !== 'GET' && req.headers['x-etricks'] !== '1') throw new HttpError(403, 'Missing request header');
 
   const body = req.method === 'GET' ? {} : await readBody(req, route.opts.maxBody);

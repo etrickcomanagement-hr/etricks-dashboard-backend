@@ -3,6 +3,8 @@ const auth = require('../../core/auth');
 const accounts = require('../../core/accounts');
 const db = require('../../core/db');
 const notify = require('../../core/notify');
+const { converter } = require('../../core/currency');
+const orders = require('../orders');
 const { HttpError, str, int, num, date, oneOf, bad, today, addDays, round } = require('../../core/util');
 
 /*
@@ -116,12 +118,18 @@ function chatRecipients(c) {
 }
 
 // Who the admin can pick from: the leader and members of the team (or of the department when the client has no team).
-function candidates(departmentId, teamId) {
+// One person can work for at most this many clients (each client is a separate sheet of that person).
+const MAX_CLIENTS_PER_PERSON = 5;
+
+// `otherClients` = how many OTHER clients the person already works for (so the list can show who is full).
+function candidates(departmentId, teamId, exceptClientId = null) {
   return db.all(
-    `SELECT e.id, e.name, e.emp_code, e.role, e.team_id, t.name AS team_name FROM employees e LEFT JOIN teams t ON t.id=e.team_id
+    `SELECT e.id, e.name, e.emp_code, e.role, e.team_id, t.name AS team_name,
+            (SELECT COUNT(*) FROM client_staff s WHERE s.employee_id=e.id AND s.client_id<>COALESCE(?, 0)) AS other_clients
+       FROM employees e LEFT JOIN teams t ON t.id=e.team_id
       WHERE e.status='active' AND e.department_id=? AND e.role IN ('team_leader','member') AND (? IS NULL OR e.team_id=?)
-      ORDER BY (e.role='team_leader') DESC, t.name, e.name`, departmentId, teamId ?? null, teamId ?? null)
-    .map((e) => ({ id: e.id, name: e.name, empCode: e.empCode, role: e.role === 'team_leader' ? 'Team leader' : 'Member', teamName: e.teamName }));
+      ORDER BY (e.role='team_leader') DESC, t.name, e.name`, exceptClientId, departmentId, teamId ?? null, teamId ?? null)
+    .map((e) => ({ id: e.id, name: e.name, empCode: e.empCode, role: e.role === 'team_leader' ? 'Team leader' : 'Member', teamName: e.teamName, otherClients: e.otherClients, limit: MAX_CLIENTS_PER_PERSON }));
 }
 
 // Replace the chosen people of a client. Only people from the right department/team are accepted. Call inside db.tx.
@@ -130,11 +138,16 @@ function setStaff(c, employeeIds, ctx) {
   const ok = new Set(candidates(c.departmentId, c.teamId).map((e) => e.id));
   if (wanted.some((id) => !ok.has(id))) throw bad('Some of the chosen people do not belong to that team');
   const before = new Set(db.all('SELECT employee_id FROM client_staff WHERE client_id=?', c.id).map((r) => r.employeeId));
+  // nobody can be given a sixth client
+  for (const id of wanted.filter((x) => !before.has(x))) {
+    const n = db.get('SELECT COUNT(*) AS n FROM client_staff WHERE employee_id=? AND client_id<>?', id, c.id).n;
+    if (n >= MAX_CLIENTS_PER_PERSON) throw bad(`${db.get('SELECT name FROM employees WHERE id=?', id)?.name || 'This person'} already works for ${MAX_CLIENTS_PER_PERSON} clients, the most one person can have. Remove them from one of those clients first`);
+  }
   db.run('DELETE FROM client_staff WHERE client_id=?', c.id);
   for (const id of wanted) db.run('INSERT INTO client_staff(client_id, employee_id, added_at) VALUES (?,?,?)', c.id, id, new Date().toISOString());
   const added = wanted.filter((id) => !before.has(id));
   const removed = [...before].filter((id) => !wanted.includes(id));
-  for (const id of added) notify.send({ employeeId: id }, { title: `You were added to client ${c.username}`, body: 'You can now see its updates and chat.', link: '#/client-updates', kind: 'chat' });
+  for (const id of added) notify.send({ employeeId: id }, { title: `You were added to client ${c.username}`, body: 'You can now see its chat and keep its daily sheet.', link: '#/my-orders', kind: 'chat' });
   for (const id of removed) notify.send({ employeeId: id }, { title: `You were removed from client ${c.username}`, body: 'You no longer have access to it.', kind: 'chat' });
   tidyOwner(c.id);
   if (added.length || removed.length) ctx.audit('client_team_changed', 'client', c.id, `${c.username}: +${added.length} -${removed.length}, now ${wanted.length} people`, c.departmentId);
@@ -209,6 +222,12 @@ module.exports = {
      UPDATE clients SET chat_owner_id=NULL WHERE chat_owner_id IS NOT NULL
         AND chat_owner_id NOT IN (SELECT id FROM employees WHERE role='hod')
         AND chat_owner_id NOT IN (SELECT employee_id FROM client_staff WHERE client_id=clients.id);`,
+    // 5: every client is a sheet of its own. A member who works for exactly one client keeps what they wrote so far on that
+    // client's sheet; a member with several keeps it on the general sheet (nothing is lost, nothing is guessed).
+    `UPDATE member_orders SET client_id = (SELECT s.client_id FROM client_staff s JOIN clients c ON c.id=s.client_id WHERE s.employee_id=member_orders.employee_id AND c.status='active')
+      WHERE client_id IS NULL AND (SELECT COUNT(*) FROM client_staff s JOIN clients c ON c.id=s.client_id WHERE s.employee_id=member_orders.employee_id AND c.status='active') = 1;
+     UPDATE order_columns SET client_id = (SELECT s.client_id FROM client_staff s JOIN clients c ON c.id=s.client_id WHERE s.employee_id=order_columns.employee_id AND c.status='active')
+      WHERE client_id IS NULL AND (SELECT COUNT(*) FROM client_staff s JOIN clients c ON c.id=s.client_id WHERE s.employee_id=order_columns.employee_id AND c.status='active') = 1;`,
   ],
 
   routes(m) {
@@ -218,16 +237,22 @@ module.exports = {
       const rows = db.all(`${CLIENT_SELECT} ORDER BY d.sort, c.username`).filter((c) => inScope(ctx, c) && (ctx.user.role === 'admin' || c.status === 'active'));
       const ids = rows.map((c) => c.id);
       const last = lastMessages(ids);
-      const day = today();
-      const reports = ids.length ? db.all(`SELECT client_id, date, orders, investment, sales FROM client_reports WHERE client_id IN (${ids.map(() => '?').join(',')})`, ...ids) : [];
-      const by = {};
-      for (const r of reports) (by[r.clientId] ||= []).push(r);
+      const conv = converter();
+      // what the sheets sent to each client add up to, in the company currency
+      const sales = (clientId) => {
+        const t = { today: { sales: 0, profit: 0 }, total: { sales: 0, profit: 0 } };
+        for (const cur of orders.salesFromCopies(clientId)) {
+          t.today.sales += conv(cur.today.sales, cur.currency); t.today.profit += conv(cur.today.profit, cur.currency);
+          t.total.sales += conv(cur.total.sales, cur.currency); t.total.profit += conv(cur.total.profit, cur.currency);
+        }
+        return { today: { sales: round(t.today.sales), profit: round(t.today.profit) }, total: { sales: round(t.total.sales), profit: round(t.total.profit) } };
+      };
       return rows.map((c) => {
         const info = chatInfo(ctx, c);
         const hide = info.chat === 'colleague' && ctx.user.role !== 'admin'; // somebody else answers this client: no chat details
         return {
           ...shape(ctx, c), ...info,
-          today: sums((by[c.id] || []).filter((r) => r.date === day)), total: sums(by[c.id] || []),
+          ...sales(c.id),
           inquiryNeedsReply: !hide && !!last[c.id]?.inquiry?.fromClient, alertNeedsReply: !hide && !!last[c.id]?.alert?.fromClient,
           lastInquiryAt: hide ? null : last[c.id]?.inquiry?.at ?? null, lastAlertAt: hide ? null : last[c.id]?.alert?.at ?? null,
         };
@@ -277,7 +302,7 @@ module.exports = {
     m.get('/api/clients/:id/staff', { roles: ['admin'] }, (ctx) => {
       const c = staffClient(ctx, ctx.params.id);
       const chosen = new Set(staffIds(c));
-      return { candidates: candidates(c.departmentId, c.teamId).map((e) => ({ ...e, chosen: chosen.has(e.id) })) };
+      return { candidates: candidates(c.departmentId, c.teamId, c.id).map((e) => ({ ...e, chosen: chosen.has(e.id) })) };
     });
 
     // Add or remove people later: send the full list of people who should be in the client's chat.
@@ -341,71 +366,6 @@ module.exports = {
       db.run('DELETE FROM sheet_publications WHERE client_id=?', c.id);
       db.run('DELETE FROM clients WHERE id=?', c.id); // reports and messages go with it
       ctx.audit('client_deleted', 'client', c.id, c.username, c.departmentId);
-      return { ok: true };
-    });
-
-    // =============================== staff: the daily numbers for a client ===============================
-    const REPORT_SELECT = 'SELECT r.*, c.username FROM client_reports r JOIN clients c ON c.id=r.client_id';
-    const reportInput = (b) => {
-      const day = date(b.date, 'Date', { required: true });
-      if (day > today()) throw bad('Date cannot be in the future');
-      const e = {
-        date: day, market: str(b.market, 'Market', { max: 100 }), store: str(b.store, 'Store / account', { max: 100 }),
-        orders: int(b.orders ?? 0, 'Orders', { min: 0, max: 1e7 }), investment: num(b.investment ?? 0, 'Investment', { min: 0, max: 1e9 }), sales: num(b.sales ?? 0, 'Sales', { min: 0, max: 1e9 }),
-        note: str(b.note, 'Update for the client', { max: 1000 }),
-      };
-      if (!e.orders && !e.investment && !e.sales && !e.note) throw bad('Enter at least orders, investment, sales or an update');
-      return e;
-    };
-    // A person edits their own entry for 7 days; leaders and heads (of that client) and the admin any entry.
-    const canEditReport = (ctx, r, c) => {
-      if (ctx.user.role === 'admin') return true;
-      if ((ctx.user.role === 'leader' || ctx.user.role === 'hod') && inScope(ctx, c)) return true;
-      return r.submittedBy != null && r.submittedBy === ctx.user.employeeId && r.createdAt >= addDays(today(), -7);
-    };
-
-    m.get('/api/client-reports', { roles: STAFF }, (ctx) => {
-      const q = ctx.query;
-      const from = q.from ? date(q.from, 'From') : addDays(today(), -30);
-      const to = q.to ? date(q.to, 'To') : today();
-      const clients = Object.fromEntries(db.all(`${CLIENT_SELECT}`).filter((c) => inScope(ctx, c) && (!q.clientId || c.id === Number(q.clientId))).map((c) => [c.id, c]));
-      const ids = Object.keys(clients).map(Number);
-      if (!ids.length) return { rows: [], totals: sums([]) };
-      const rows = db.all(`${REPORT_SELECT} WHERE r.client_id IN (${ids.map(() => '?').join(',')}) AND r.date BETWEEN ? AND ? ORDER BY r.date DESC, r.id DESC LIMIT 1000`, ...ids, from, to)
-        .map((r) => ({ ...r, revenue: revenueOf(r), canEdit: canEditReport(ctx, r, clients[r.clientId]), by: r.submittedLabel || 'Team' }));
-      return { rows, totals: sums(rows) };
-    });
-
-    m.post('/api/client-reports', { roles: STAFF }, (ctx) => {
-      const c = staffClient(ctx, ctx.body.clientId);
-      if (c.status !== 'active') throw bad('This client is disabled');
-      const e = reportInput(ctx.body);
-      if (ctx.user.role === 'member' && e.date < addDays(today(), -31)) throw bad('You can only add updates from the last 31 days');
-      const now = new Date().toISOString();
-      const label = ctx.user.role === 'admin' ? 'Administrator' : db.get('SELECT name FROM employees WHERE id=?', ctx.user.employeeId)?.name;
-      const r = db.insert('client_reports', { clientId: c.id, ...e, submittedBy: ctx.user.employeeId ?? null, submittedLabel: label, createdAt: now, updatedAt: now });
-      ctx.audit('client_update', 'client', c.id, `${c.username} ${e.date}: ${e.orders} orders, sales ${e.sales}`, c.departmentId);
-      return { id: r.id };
-    });
-
-    m.put('/api/client-reports/:id', { roles: STAFF }, (ctx) => {
-      const r = db.get('SELECT * FROM client_reports WHERE id=?', int(ctx.params.id, 'Update', { required: true }));
-      if (!r) throw new HttpError(404, 'Update not found');
-      const c = staffClient(ctx, r.clientId);
-      if (!canEditReport(ctx, r, c)) throw new HttpError(403, 'You can only change your own updates for 7 days');
-      const e = reportInput(ctx.body);
-      db.update('client_reports', r.id, { ...e, updatedAt: new Date().toISOString() });
-      ctx.audit('client_update_edited', 'client', c.id, `${c.username} ${e.date}`, c.departmentId);
-      return { ok: true };
-    });
-
-    m.del('/api/client-reports/:id', { roles: STAFF }, (ctx) => {
-      const r = db.get('SELECT * FROM client_reports WHERE id=?', int(ctx.params.id, 'Update', { required: true }));
-      if (!r) throw new HttpError(404, 'Update not found');
-      const c = staffClient(ctx, r.clientId);
-      if (!canEditReport(ctx, r, c)) throw new HttpError(403, 'You can only delete your own updates for 7 days');
-      db.run('DELETE FROM client_reports WHERE id=?', r.id);
-      ctx.audit('client_update_deleted', 'client', c.id, `${c.username} ${r.date}`, c.departmentId);
       return { ok: true };
     });
 
@@ -500,33 +460,6 @@ module.exports = {
     // =============================== the client portal ===============================
     const CLIENT = ['client'];
     const me = (ctx) => db.get(`${CLIENT_SELECT} WHERE c.id=?`, ctx.user.clientId);
-
-    m.get('/api/portal/sales', { roles: CLIENT }, (ctx) => {
-      const c = me(ctx);
-      const day = today();
-      const from = ctx.query.from ? date(ctx.query.from, 'From') : addDays(day, -29);
-      const to = ctx.query.to ? date(ctx.query.to, 'To') : day;
-      if (from > to) throw bad('"To" cannot be before "From"');
-      const all = db.all('SELECT date, market, store, orders, investment, sales, note FROM client_reports WHERE client_id=? ORDER BY date', c.id);
-      const inRange = all.filter((r) => r.date >= from && r.date <= to);
-      const byDay = new Map();
-      for (const r of inRange) { if (!byDay.has(r.date)) byDay.set(r.date, []); byDay.get(r.date).push(r); }
-      const days = [...byDay.entries()].sort((a, b) => b[0].localeCompare(a[0])).map(([d, rs]) => ({
-        date: d, ...sums(rs),
-        // what was done that day, as written for the client: always "eTricks"
-        updates: rs.map((r) => ({ market: r.market, store: r.store, orders: r.orders, investment: r.investment, sales: r.sales, revenue: revenueOf(r), note: r.note })),
-      }));
-      const monthStart = `${day.slice(0, 8)}01`;
-      const chart = [];
-      for (let i = 13; i >= 0; i--) { const d = addDays(day, -i); chart.push({ date: d, ...sums(all.filter((r) => r.date === d)) }); }
-      return {
-        username: c.username, departmentName: c.departmentName, from, to,
-        today: { date: day, ...sums(all.filter((r) => r.date === day)) },
-        month: sums(all.filter((r) => r.date >= monthStart)),
-        total: { ...sums(all), since: all[0]?.date ?? null, days: new Set(all.map((r) => r.date)).size },
-        range: sums(inRange), days, chart,
-      };
-    });
 
     m.get('/api/portal/summary', { roles: CLIENT }, (ctx) => {
       const n = (channel) => db.get('SELECT COUNT(*) AS n FROM client_messages WHERE client_id=? AND channel=? AND from_client=0 AND read_at IS NULL', ctx.user.clientId, channel).n;
