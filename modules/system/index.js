@@ -15,6 +15,14 @@ module.exports = {
   core: true,
   order: 90,
 
+  migrations: [
+    // The full backups made every 30 days: one row each, kept as a history even after the file is deleted.
+    `CREATE TABLE full_backups (
+       id INTEGER PRIMARY KEY, file TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, created_at TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL,
+       table_count INTEGER, row_count INTEGER, expires_at TEXT, downloaded_at TEXT, downloaded_by TEXT, warned INTEGER NOT NULL DEFAULT 0,
+       removed_at TEXT, removed_reason TEXT);`,
+  ],
+
   routes(m) {
     const any = ['admin', 'hod', 'leader', 'member', 'client'];
     const lead = ['admin', 'hod']; // the activity log is for the admin and (for their department) the head
@@ -167,7 +175,41 @@ module.exports = {
       return rows;
     });
 
-    // ---- backups (admin only) ----
+    // ---- full backups: every 30 days, download within 7 days or they are deleted (admin only) ----
+    m.get('/api/backups/full', { roles: ['admin'] }, () => ({ ...backup.summary(), items: backup.listFull() }));
+    m.get('/api/backups/summary', { roles: ['admin'] }, () => backup.summary()); // light call for the warning bar
+
+    m.post('/api/backups/full', { roles: ['admin'] }, (ctx) => {
+      let b;
+      try { b = backup.createFull('manual'); } catch (e) { throw bad(e.message); }
+      ctx.audit('backup_full_created', 'backup', b.id, `${b.name} (${b.tables} tables, ${b.rows} rows)`, null);
+      return b;
+    });
+
+    m.get('/api/backups/full/:id/download', { roles: ['admin'] }, (ctx) => {
+      const id = int(ctx.params.id, 'Backup', { required: true });
+      const f = backup.fullFile(id);
+      if (!f) throw new HttpError(404, 'This backup is no longer on the server');
+      ctx.audit('backup_full_download_started', 'backup', id, f.row.file, null);
+      // It counts as downloaded only once the whole file has been sent; then it no longer expires.
+      return {
+        __file: true, path: f.path, name: f.row.file,
+        onDone: () => { backup.markDownloaded(id, ctx.user.label); ctx.audit('backup_full_downloaded', 'backup', id, f.row.file, null); },
+      };
+    });
+
+    // After downloading, the admin can remove the copy from the server. A copy that was never downloaded cannot be deleted by mistake.
+    m.del('/api/backups/full/:id', { roles: ['admin'] }, (ctx) => {
+      const id = int(ctx.params.id, 'Backup', { required: true });
+      const f = backup.fullFile(id);
+      if (!f) throw new HttpError(404, 'This backup is no longer on the server');
+      if (!f.row.downloadedAt) throw bad('Download this backup first. It can be deleted from the server only after you have downloaded it.');
+      backup.removeFull(id, 'Deleted by the admin after downloading');
+      ctx.audit('backup_full_deleted', 'backup', id, f.row.file, null);
+      return { ok: true };
+    });
+
+    // ---- daily safety copies (admin only) ----
     m.get('/api/backups', { roles: ['admin'] }, () => backup.list());
 
     m.post('/api/backups', { roles: ['admin'] }, (ctx) => {

@@ -18,6 +18,11 @@ module.exports = {
   dbFile: path.join(dataDir, 'etricks.db'),
   backupDir: path.join(dataDir, 'backups'),
   backupKeep: Number(process.env.BACKUP_KEEP) || 30,
+  // The full backup: a complete copy of everything, made every N days for the admin to download.
+  fullBackupDir: path.join(dataDir, 'backups', 'full'),
+  fullBackupDays: Number(process.env.FULL_BACKUP_DAYS) || 30,
+  fullBackupGraceDays: Number(process.env.FULL_BACKUP_GRACE_DAYS) || 7, // days the admin has to download it before it is deleted
+  fullBackupKeep: Number(process.env.FULL_BACKUP_KEEP) || 3, // downloaded copies that stay on the server (the newest ones)
   sessionHours: Number(process.env.SESSION_HOURS) || 12,
   secureCookies: process.env.SECURE_COOKIES === '1',
   trustProxy: process.env.TRUST_PROXY === '1',

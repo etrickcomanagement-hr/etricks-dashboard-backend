@@ -312,7 +312,8 @@ module.exports = {
       for (const f of fin) for (const k of Object.keys(tot)) tot[k] += f[k];
 
       const perf = performance('employee', mFrom, day, { departmentId: dept, teamId: team, rolesCsv });
-      const pendingLeave = (deptId, teamId) => db.get(
+      // Leave requests are the admin's alone: nobody else is shown (or told) how many are waiting.
+      const pendingLeave = (deptId, teamId) => ctx.user.role !== 'admin' ? 0 : db.get(
         `SELECT COUNT(*) AS n FROM leave_requests l JOIN employees e ON e.id=l.employee_id
           WHERE l.status='pending' AND instr(?, ',' || e.role || ',') > 0 AND (? IS NULL OR e.department_id=?) AND (? IS NULL OR e.team_id=?)`, rolesCsv, deptId, deptId, teamId, teamId).n;
 
@@ -355,7 +356,7 @@ module.exports = {
         date: day, scope: dept, team,
         today: { employees: stats.employees, present: stats.present, late: stats.late, onLeave: stats.onLeave, notMarked: stats.notMarked },
         pending: {
-          attendance: stats.pendingAttendance, leave: pendingLeave(dept, team), tasks: toReview,
+          attendance: stats.pendingAttendance, leave: ctx.user.role === 'admin' ? pendingLeave(dept, team) : null, tasks: toReview,
           issues: db.get("SELECT COUNT(*) AS n FROM issues WHERE status IN ('open','in_review') AND ((? = 'admin' AND recipient_role='admin') OR recipient_id = ?)", ctx.user.role, ctx.user.employeeId ?? -1).n,
         },
         tasks: {

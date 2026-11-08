@@ -224,17 +224,23 @@ async function main() {
     const lv = await member('POST', '/api/leave', { leaveType: 'Casual', fromDate: D(MON), toDate: D(MON, 2), reason: 'Family event' });
     check('leave request (3 working days)', lv.status === 200 && lv.data.days === 3, JSON.stringify(lv.data));
     check('overlapping leave refused', (await member('POST', '/api/leave', { leaveType: 'Sick', fromDate: D(MON, 1), toDate: D(MON, 1), reason: 'x' })).status === 400);
-    check('leave list works without date filters', (await leaderA2('GET', '/api/leave')).status === 200);
-    check('another team cannot see or decide it', (await leaderB('GET', '/api/leave')).data.length === 0 && (await leaderB('POST', `/api/leave/${lv.data.id}/decision`, { status: 'approved' })).status === 403);
-    check('leader approves member leave', (await leaderA2('POST', `/api/leave/${lv.data.id}/decision`, { status: 'approved' })).status === 200);
+    check('the admin sees the leave list (no date filters needed)', (await admin('GET', '/api/leave')).status === 200 && (await admin('GET', '/api/leave')).data.some((l) => l.id === lv.data.id && l.canDecide === true));
+    check('leaders and heads cannot see leave requests at all', (await leaderA2('GET', '/api/leave')).status === 403 && (await leaderB('GET', '/api/leave')).status === 403 && (await hodNew('GET', '/api/leave')).status === 403 && (await member('GET', '/api/leave')).status === 403);
+    check('leaders and heads cannot decide a member\'s leave', (await leaderA2('POST', `/api/leave/${lv.data.id}/decision`, { status: 'approved' })).status === 403 && (await leaderB('POST', `/api/leave/${lv.data.id}/decision`, { status: 'approved' })).status === 403 && (await hodNew('POST', `/api/leave/${lv.data.id}/decision`, { status: 'approved' })).status === 403
+      && (await member('POST', `/api/leave/${lv.data.id}/decision`, { status: 'approved' })).status === 403);
+    check('the admin approves member leave', (await admin('POST', `/api/leave/${lv.data.id}/decision`, { status: 'approved' })).status === 200);
     const llv = await leaderA2('POST', '/api/leave', { leaveType: 'Casual', fromDate: D(MON, 7), toDate: D(MON, 8), reason: 'Wedding' });
     check('team leader requests leave', llv.status === 200);
-    check('leader cannot approve their own leave', (await leaderA2('POST', `/api/leave/${llv.data.id}/decision`, { status: 'approved' })).status === 403);
-    check('another leader cannot approve it', (await leaderB('POST', `/api/leave/${llv.data.id}/decision`, { status: 'approved' })).status === 403);
-    check('head approves the leader\'s leave', (await hodNew('GET', '/api/leave')).data.find((l) => l.id === llv.data.id).canDecide === true && (await hodNew('POST', `/api/leave/${llv.data.id}/decision`, { status: 'approved' })).status === 200);
+    check('nobody but the admin decides the leader\'s leave: not the leader, another leader, nor the head', (await leaderA2('POST', `/api/leave/${llv.data.id}/decision`, { status: 'approved' })).status === 403 && (await leaderB('POST', `/api/leave/${llv.data.id}/decision`, { status: 'approved' })).status === 403
+      && (await hodNew('POST', `/api/leave/${llv.data.id}/decision`, { status: 'approved' })).status === 403);
+    check('the admin approves the leader\'s leave', (await admin('POST', `/api/leave/${llv.data.id}/decision`, { status: 'approved' })).status === 200);
     const hlv = await hodNew('POST', '/api/leave', { leaveType: 'Casual', fromDate: D(MON, 14), toDate: D(MON, 14), reason: 'Personal' });
     check('head requests leave, only the admin decides', hlv.status === 200 && (await hodNew('POST', `/api/leave/${hlv.data.id}/decision`, { status: 'approved' })).status === 403
       && (await admin('POST', `/api/leave/${hlv.data.id}/decision`, { status: 'approved' })).status === 200);
+    check('the admin sees all three requests, from a member, a leader and a head', (await admin('GET', '/api/leave?status=approved')).data.filter((l) => [lv.data.id, llv.data.id, hlv.data.id].includes(l.id)).length === 3);
+    check('a decided request cannot be decided by the wrong people afterwards either', (await leaderA2('POST', `/api/leave/${lv.data.id}/decision`, { status: 'rejected' })).status === 403 && (await admin('GET', '/api/leave?status=approved')).data.some((l) => l.id === lv.data.id));
+    check('leave figures on dashboards are the admin\'s only', (await leaderA2('GET', '/api/dashboard')).data.pending.leave === null && (await hodNew('GET', '/api/dashboard')).data.pending.leave === null && typeof (await admin('GET', '/api/dashboard')).data.pending.leave === 'number'
+      && (await hodNew('GET', '/api/dashboard')).data.teams.every((t) => t.pendingLeave === 0));
     check('leader\'s leave history', (await leaderA2('GET', '/api/leave/me')).data.length === 1);
 
     console.log('Tasks & work logs');
@@ -366,13 +372,13 @@ async function main() {
     console.log('Notifications');
     const leaderNotes = (await leaderA2('GET', '/api/notifications?limit=100')).data;
     check('leader notified when member checks in and out', leaderNotes.items.some((n) => /Ali Raza checked in/.test(n.title)) && leaderNotes.items.some((n) => /Ali Raza checked out/.test(n.title)));
-    check('leader notified of leave request and finished task', leaderNotes.items.some((n) => /requested leave/.test(n.title)) && leaderNotes.items.some((n) => /submitted a task for approval/.test(n.title)));
+    check('leader is told of the finished task, but not of leave requests (the admin decides those)', !leaderNotes.items.some((n) => /requested leave/.test(n.title)) && leaderNotes.items.some((n) => /submitted a task for approval/.test(n.title)));
     const hodNotes = (await hodNew('GET', '/api/notifications?limit=100')).data;
     check('head notified when a team leader checks in', hodNotes.items.some((n) => /Lina Lead checked in/.test(n.title)));
-    check('head notified of the leader\'s leave request and task', hodNotes.items.some((n) => /Lina Lead requested leave/.test(n.title)) && hodNotes.items.some((n) => /Lina Lead submitted a task for approval/.test(n.title)));
+    check('head is told of the leader\'s task, but not of the leader\'s leave request', !hodNotes.items.some((n) => /requested leave/.test(n.title)) && hodNotes.items.some((n) => /Lina Lead submitted a task for approval/.test(n.title)));
     const adminNotes = (await admin('GET', '/api/notifications?limit=100')).data;
     check('admin notified of leader and head attendance', adminNotes.items.some((n) => /Lina Lead checked in/.test(n.title)) && adminNotes.items.some((n) => /Hamza Head checked in/.test(n.title)));
-    check('admin notified of the head\'s leave request', adminNotes.items.some((n) => /Hamza Head requested leave/.test(n.title)));
+    check('admin notified of every leave request: member, leader and head', adminNotes.items.some((n) => /Hamza Head requested leave/.test(n.title)) && adminNotes.items.some((n) => /Lina Lead requested leave/.test(n.title)) && adminNotes.items.some((n) => /Ali Raza requested leave/.test(n.title)));
     const memberNotes = (await member2('GET', '/api/notifications?limit=100')).data;
     check('member notified of task, approvals and salary', memberNotes.items.some((n) => /New task assigned/.test(n.title)) && memberNotes.items.some((n) => /Attendance approved/.test(n.title))
       && memberNotes.items.some((n) => /leave was approved/.test(n.title)) && memberNotes.items.some((n) => /Salary payment recorded/.test(n.title)));
@@ -526,7 +532,7 @@ async function main() {
     check('full history moved along (joined + changes + transfer)', after.history.length === before.history.length + 1 && after.history.some((h) => h.eventType === 'joined') && after.history.some((h) => h.eventType === 'team_change'));
     check('old attendance is now in the new team', (await leaderB('GET', `/api/attendance?from=${TWO_AGO}&to=${TODAY}`)).data.some((r) => r.employeeId === empId) && (await leaderA2('GET', `/api/attendance?from=${TWO_AGO}&to=${TODAY}`)).data.every((r) => r.employeeId !== empId));
     check('orders, tasks, leave and complaints follow the person', (await leaderB('GET', `/api/orders?from=${YESTERDAY}&to=${TODAY}`)).data.totals.orders === 25
-      && (await leaderB('GET', '/api/tasks')).data.some((t) => t.assigneeName === 'Ali Raza') && (await leaderB('GET', '/api/leave')).data.some((l) => l.employeeId === empId)
+      && (await leaderB('GET', '/api/tasks')).data.some((t) => t.assigneeName === 'Ali Raza') && (await admin('GET', `/api/leave?employeeId=${empId}`)).data.some((l) => l.teamId === tB)
       && (await leaderB('GET', `/api/complaints?employeeId=${empId}`)).data.length === 2);
     check('the member\'s report moves too', (await leaderB('GET', `/api/reports/employee/${empId}?from=${TWO_AGO}&to=${TODAY}`)).data.orders.orders === 22);
     check('old session ended, old team password stops working', (await member2('GET', '/api/orders/me')).status === 401
@@ -1032,6 +1038,47 @@ async function main() {
     check('manual backup (pressed twice in a second is fine)', (await admin('POST', '/api/backups')).status === 200 && (await admin('POST', '/api/backups')).status === 200);
     check('backup list', (await admin('GET', '/api/backups')).data.length >= 2);
     check('backups admin only', (await hodNew('GET', '/api/backups')).status === 403);
+
+    console.log('Full backup (every 30 days, download or it is deleted)');
+    const fb0 = (await admin('GET', '/api/backups/full')).data;
+    check('settings: a 30-day cycle with 7 days to download; nothing is waiting at first', fb0.days === 30 && fb0.graceDays === 7 && fb0.alert === null && fb0.items.length === 0 && /^\d{4}-\d{2}-\d{2}T/.test(fb0.nextDue)
+      && Math.round((Date.parse(fb0.nextDue) - Date.now()) / 864e5) === 30);
+    const fbNew = await admin('POST', '/api/backups/full');
+    check('the admin makes a full backup now: checked, with a checksum and the number of tables and rows', fbNew.status === 200 && fbNew.data.status === 'ready' && fbNew.data.daysLeft === 7 && /^[0-9a-f]{64}$/.test(fbNew.data.sha256) && fbNew.data.tables > 20 && fbNew.data.rows > 100 && fbNew.data.size > 50000, JSON.stringify(fbNew.data));
+    check('pressed twice in a second is fine', (await admin('POST', '/api/backups/full')).status === 200);
+    const fbId = fbNew.data.id;
+    check('the file is really in its own folder, apart from the daily copies', fs.existsSync(path.join(DATA, 'backups', 'full', fbNew.data.name)) && !(await admin('GET', '/api/backups')).data.some((b) => b.name.includes('-full-')));
+    const fbSum = (await admin('GET', '/api/backups/summary')).data;
+    check('the admin is warned: a backup waits for download, with the last day', fbSum.alert && fbSum.alert.count >= 1 && fbSum.alert.daysLeft === 7 && /^\d{4}-\d{2}-\d{2}T/.test(fbSum.alert.expiresAt));
+    const delEarly = await admin('DELETE', `/api/backups/full/${fbId}`);
+    check('a backup that was never downloaded cannot be deleted by mistake', delEarly.status === 400 && /Download this backup first/.test(delEarly.data.error) && fs.existsSync(path.join(DATA, 'backups', 'full', fbNew.data.name)));
+    const fbSt = [(await hodNew('GET', '/api/backups/full')).status, (await leaderA2('GET', '/api/backups/summary')).status, (await hodNew('POST', '/api/backups/full')).status, (await hodNew("GET", `/api/backups/full/${fbId}/download`)).status, (await hodNew('DELETE', `/api/backups/full/${fbId}`)).status, (await anon('GET', '/api/backups/full')).status];
+    check('only the admin can see, make, download or delete full backups', fbSt.join() === '403,403,403,403,403,401', fbSt.join());
+    check('an unknown backup number is 404', (await admin('GET', '/api/backups/full/99999/download')).status === 404 && (await admin('DELETE', '/api/backups/full/99999')).status === 404);
+    const got = await admin('GET', `/api/backups/full/${fbId}/download`);
+    check('the download is the whole file (the size announced)', got.status === 200 && /attachment/.test(got.headers.get('content-disposition')) && Number(got.headers.get('content-length')) === fbNew.data.size);
+    await new Promise((r) => setTimeout(r, 400));
+    const fbAfter = (await admin('GET', '/api/backups/full')).data.items.find((x) => x.id === fbId);
+    check('once downloaded it is marked as downloaded and no longer expires', fbAfter.status === 'downloaded' && fbAfter.expiresAt === null && !!fbAfter.downloadedAt && fbAfter.downloadedBy);
+    check('the warning goes away when everything waiting has been downloaded', (await admin('GET', '/api/backups/summary')).data.alert === null);
+    const fbCopy = fs.readFileSync(path.join(DATA, 'backups', 'full', fbNew.data.name));
+    check('the copy is a complete database: it opens, passes the integrity check and holds the people and the departments', (() => {
+      const tmp = path.join(os.tmpdir(), `etx-open-${Date.now()}.db`);
+      fs.writeFileSync(tmp, fbCopy);
+      const { DatabaseSync } = require('node:sqlite');
+      const t = new DatabaseSync(tmp);
+      try {
+        const ok = Object.values(t.prepare('PRAGMA integrity_check').get())[0] === 'ok';
+        const people = Number(t.prepare('SELECT COUNT(*) AS n FROM employees').get().n);
+        const depts = Number(t.prepare('SELECT COUNT(*) AS n FROM departments').get().n);
+        const sha = crypto.createHash('sha256').update(fbCopy).digest('hex');
+        return ok && people > 5 && depts === 6 && sha === fbNew.data.sha256;
+      } finally { t.close(); fs.unlinkSync(tmp); }
+    })());
+    check('after downloading, the admin can delete it from the server (the file goes, the history stays)', (await admin('DELETE', `/api/backups/full/${fbId}`)).status === 200 && !fs.existsSync(path.join(DATA, 'backups', 'full', fbNew.data.name))
+      && (await admin('GET', '/api/backups/full')).data.items.find((x) => x.id === fbId).status === 'deleted' && (await admin('GET', `/api/backups/full/${fbId}/download`)).status === 404 && (await admin('DELETE', `/api/backups/full/${fbId}`)).status === 404);
+    const flog = (await admin('GET', '/api/logs?limit=500')).data;
+    check('every step is in the activity log', ['backup_full_created', 'backup_full_download_started', 'backup_full_downloaded', 'backup_full_deleted'].every((a) => flog.some((l) => l.action === a)));
     check('disable a module', (await admin('PUT', '/api/modules/finance', { enabled: false })).status === 200 && (await leaderA2('GET', '/api/finance')).status === 404);
     await admin('PUT', '/api/modules/finance', { enabled: true });
     check('deactivated employee loses access', (await hodNew('PUT', `/api/employees/${bina.data.id}`, { ...(await hodNew('GET', `/api/employees/${bina.data.id}`)).data, status: 'inactive' })).status === 200 && (await bm('GET', '/api/attendance/me/today')).status === 401);

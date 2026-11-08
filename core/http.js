@@ -129,8 +129,12 @@ async function handleApi(req, res, url) {
     return res.end(result.body);
   }
   if (result && result.__file) {
-    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="${result.name}"` });
-    return fs.createReadStream(result.path).pipe(res);
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="${result.name}"`, 'Content-Length': fs.statSync(result.path).size, 'Cache-Control': 'no-store' });
+    // onDone runs only when the whole file has been handed over (a cancelled download does not count)
+    if (result.onDone) res.on('finish', () => { try { result.onDone(); } catch (e) { console.error('[download] after-download step failed', e.message); } });
+    const rs = fs.createReadStream(result.path);
+    rs.on('error', () => res.destroy());
+    return rs.pipe(res);
   }
   sendJson(res, 200, result === undefined ? { ok: true } : result);
 }

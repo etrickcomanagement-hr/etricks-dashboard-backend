@@ -21,7 +21,7 @@ const personOf = (l) => ({ id: l.employeeId, role: l.role, departmentId: l.depar
 module.exports = {
   id: 'leave',
   name: 'Leave Management',
-  description: 'Leave requests from members, team leaders and heads, decided by the person above them.',
+  description: 'Leave requests from members, team leaders and heads. Only the admin sees them and decides.',
   order: 40,
 
   migrations: [
@@ -34,7 +34,7 @@ module.exports = {
   ],
 
   routes(m) {
-    const lead = ['admin', 'hod', 'leader'];
+    const lead = ['admin']; // only the admin sees every request and approves or rejects it
     const self = ['hod', 'leader', 'member'];
 
     m.get('/api/leave/types', { roles: ['admin', 'hod', 'leader', 'member'] }, () => settings.get('leaveTypes'));
@@ -59,7 +59,7 @@ module.exports = {
       });
       ctx.audit('leave_requested', 'leave', r.id, `${from} to ${to} (${days} day/s)`);
       const me = db.get('SELECT name FROM employees WHERE id=?', ctx.user.employeeId);
-      notify.toSuperiors(ctx.user.employeeId, { title: `${me.name} requested leave`, body: `${from === to ? from : `${from} to ${to}`} · ${days} working day(s) · ${b.leaveType}`, link: '#/leave', kind: 'leave' });
+      notify.toAdmin({ title: `${me.name} requested leave`, body: `${from === to ? from : `${from} to ${to}`} · ${days} working day(s) · ${b.leaveType}`, link: '#/leave', kind: 'leave' });
       return { id: r.id, days };
     });
 
@@ -97,7 +97,7 @@ module.exports = {
       return rows;
     });
 
-    // A member's leave is decided by their leader (or head / admin), a leader's by the head (or admin), a head's by the admin.
+    // Every leave request - a member's, a team leader's, a head's - is decided by the admin alone.
     m.post('/api/leave/:id/decision', { roles: lead }, (ctx) => {
       const id = int(ctx.params.id, 'Request', { required: true });
       const l = db.get(`${SELECT} WHERE l.id=?`, id);
