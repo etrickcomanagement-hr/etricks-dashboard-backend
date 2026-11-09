@@ -53,35 +53,6 @@ const totals = (rows) => {
   };
 };
 
-// The client's Sales page: today, every day, every month and the total, for each currency, from the copies of the sheets sent to it.
-const salesFromCopies = (clientId) => {
-  const rows = db.all('SELECT data FROM sheet_publications WHERE client_id=?', clientId).flatMap((p) => parseJson(p.data, { rows: [] }).rows || []);
-  const day = today();
-  const month = day.slice(0, 7);
-  const zero = () => ({ qty: 0, investment: 0, sales: 0, profit: 0 });
-  const add = (t, r) => { t.qty += r.orders; t.investment += r.investment; t.sales += r.revenue; t.profit += r.revenue - r.investment; };
-  const fix = (t) => ({ qty: t.qty, investment: round(t.investment), sales: round(t.sales), profit: round(t.sales - t.investment) });
-  const by = {};
-  for (const r of rows) {
-    const c = (by[r.currency] ||= { today: zero(), month: zero(), total: zero(), days: new Map(), months: new Map(), first: r.date });
-    add(c.total, r);
-    if (r.date === day) add(c.today, r);
-    if (r.date.slice(0, 7) === month) add(c.month, r);
-    if (!c.days.has(r.date)) c.days.set(r.date, zero());
-    add(c.days.get(r.date), r);
-    const mo = r.date.slice(0, 7);
-    if (!c.months.has(mo)) c.months.set(mo, zero());
-    add(c.months.get(mo), r);
-    if (r.date < c.first) c.first = r.date;
-  }
-  return Object.entries(by).map(([currency, c]) => ({
-    currency, today: fix(c.today), month: fix(c.month), total: { ...fix(c.total), since: c.first, days: c.days.size },
-    days: [...c.days].sort((a, b) => b[0].localeCompare(a[0])).map(([d, t]) => ({ date: d, ...fix(t) })),
-    months: [...c.months].sort((a, b) => b[0].localeCompare(a[0])).map(([m, t]) => ({ month: m, ...fix(t) })),
-    chart: Array.from({ length: 14 }, (_, i) => { const d = addDays(day, i - 13); return { date: d, sales: round(c.days.get(d)?.sales || 0) }; }),
-  })).sort((a, b) => b.total.sales - a.total.sales);
-};
-
 module.exports = {
   id: 'orders',
   name: 'Member Orders',
@@ -419,12 +390,5 @@ module.exports = {
     m.get('/api/portal/sheet/stamp', { roles: ['client'] }, (ctx) => ({
       stamp: db.all('SELECT id, published_at FROM sheet_publications WHERE client_id=? ORDER BY id', ctx.user.clientId).map((p) => `${p.id}:${p.publishedAt}`).join('|'),
     }));
-    // The Sales page of the client: today, every day, every month and the total, from the sheets the team sent.
-    m.get('/api/portal/sales', { roles: ['client'] }, (ctx) => {
-      const info = db.get('SELECT c.username, d.name AS department_name FROM clients c JOIN departments d ON d.id=c.department_id WHERE c.id=?', ctx.user.clientId);
-      const updatedAt = db.get('SELECT MAX(published_at) AS t FROM sheet_publications WHERE client_id=?', ctx.user.clientId)?.t ?? null;
-      return { username: info?.username ?? null, departmentName: info?.departmentName ?? null, date: today(), updatedAt, currencies: salesFromCopies(ctx.user.clientId) };
-    });
   },
-  salesFromCopies,
 };

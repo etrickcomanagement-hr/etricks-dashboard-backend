@@ -646,26 +646,42 @@ async function main() {
     const e2 = await ordA(W2, { market: 'eBay UK', orders: 3, investment: 50, revenue: 120 }); // Worker Two works for one client: that is the sheet
     await ordA(W1, { clientId: c1.data.id, date: YESTERDAY, orders: 2, investment: 40, revenue: 90, note: 'Quiet day' });
     check('team members write their rows (a member with one client needs no client in the request)', e1.status === 200 && e2.status === 200);
-    const noSales = (await CL('GET', '/api/portal/sales')).data;
-    check('the client sees nothing until a member presses Update client', noSales.currencies.length === 0 && (await CL('GET', '/api/portal/sheet')).data.sheets.length === 0);
+    check('the client sees no sheet until a member presses Update client', (await CL('GET', '/api/portal/sheet')).data.sheets.length === 0);
     check('only the chosen members send a sheet to the client', (await publishTo(bm, c1.data.id)).status === 400 && (await publishTo(hodNew, c1.data.id)).status === 403 && (await publishTo(W1, c1.data.id)).status === 200 && (await publishTo(W2, c1.data.id)).status === 200);
-    const sales = (await CL('GET', '/api/portal/sales')).data;
-    const usd = sales.currencies.find((c) => c.currency === 'USD');
-    check('TODAY: qty, Ali Exp price, you earned and net profit', usd.today.qty === 8 && usd.today.investment === 150 && usd.today.sales === 420 && usd.today.profit === 270, JSON.stringify(usd && usd.today));
-    check('DAILY: one row per day', usd.days.length === 2 && usd.days[0].date === TODAY && usd.days[0].sales === 420 && usd.days[1].sales === 90 && usd.chart.length === 14);
-    check('MONTHLY: one row per month, adding up to the total', usd.months.length >= 1 && usd.months.reduce((t, m) => t + m.sales, 0) === 510 && usd.months[0].month === TODAY.slice(0, 7) && usd.month.sales >= 420);
-    check('TOTAL: everything so far', usd.total.qty === 10 && usd.total.investment === 190 && usd.total.sales === 510 && usd.total.profit === 320 && usd.total.since === YESTERDAY && sales.username === 'ali.traders' && !!sales.updatedAt);
     const sheetJson = JSON.stringify((await CL('GET', '/api/portal/sheet')).data);
-    check('PRIVATE: the client sees the sheets (notes too) but never who wrote them, nor the team-only Market / Store', !/Worker|employee|"market"|"store"|Amazon US|eBay UK|submitted/i.test(sheetJson + JSON.stringify(sales)) && sheetJson.includes('Listed 20 products') && sheetJson.includes('John, Sydney')
+    check('PRIVATE: the client sees the sheets (notes too) but never who wrote them, nor the team-only Market / Store', !/Worker|employee|"market"|"store"|Amazon US|eBay UK|submitted/i.test(sheetJson) && sheetJson.includes('Listed 20 products') && sheetJson.includes('John, Sydney')
       && (await CL('GET', '/api/portal/sheet')).data.sheets.map((x) => x.title).join() === 'Sheet 1,Sheet 2');
-    check('the client sees only its own numbers', (await CL2('GET', '/api/portal/sales')).data.currencies.length === 0);
+    check('another client sees none of these sheets', (await CL2('GET', '/api/portal/sheet')).data.sheets.length === 0);
+    const stampA = (await CL('GET', '/api/portal/sheet/stamp')).data.stamp;
     check('a member edits only their own row; the client sees the change only after the next update', (await W2('PUT', `/api/orders/${e1.data.id}`, { orders: 9 })).status === 404 && (await W1('PUT', `/api/orders/${e1.data.id}`, { orders: 6, investment: 100, revenue: 360, note: 'Corrected' })).status === 200
-      && (await CL('GET', '/api/portal/sales')).data.currencies[0].today.qty === 8 && (await publishTo(W1, c1.data.id)).status === 200 && (await CL('GET', '/api/portal/sales')).data.currencies[0].today.qty === 9);
+      && (await CL('GET', '/api/portal/sheet/stamp')).data.stamp === stampA && (await publishTo(W1, c1.data.id)).status === 200 && (await CL('GET', '/api/portal/sheet/stamp')).data.stamp !== stampA);
     check('a deleted row leaves the client sheet at the next update; a sheet without rows cannot be sent, but can be withdrawn', (await W2('DELETE', `/api/orders/${e1.data.id}`)).status === 404 && (await W2('DELETE', `/api/orders/${e2.data.id}`)).status === 200 && (await publishTo(W2, c1.data.id)).status === 400
-      && (await CL('GET', '/api/portal/sales')).data.currencies[0].today.qty === 9 && (await W2('DELETE', `/api/orders/publish/${c1.data.id}`)).status === 200 && (await CL('GET', '/api/portal/sales')).data.currencies[0].today.qty === 6);
+      && (await CL('GET', '/api/portal/sheet')).data.sheets.length === 2 && (await W2('DELETE', `/api/orders/publish/${c1.data.id}`)).status === 200 && (await CL('GET', '/api/portal/sheet')).data.sheets.length === 1);
     const e3 = await ordA(bm, { orders: 7, revenue: 70 }); // Bina works for one client (the department-wide one)
-    check('a department-wide client gets its sheet from whoever was chosen for it', e3.status === 200 && (await publishTo(bm, c2.data.id)).status === 200 && (await CL2('GET', '/api/portal/sales')).data.currencies[0].today.qty === 7);
-    check('the old Client Updates are gone', (await W1('GET', '/api/client-reports')).status === 404 && (await W1('POST', '/api/client-reports', { clientId: c1.data.id, date: TODAY, orders: 1 })).status === 404);
+    check('a department-wide client gets its sheet from whoever was chosen for it', e3.status === 200 && (await publishTo(bm, c2.data.id)).status === 200 && (await CL2('GET', '/api/portal/sheet')).data.sheets.length === 1);
+    console.log('Client updates (the numbers the client sees on Sales)');
+    check('only people of that client\'s team can add an update', (await bm('POST', '/api/client-reports', { clientId: c1.data.id, date: TODAY, orders: 1 })).status === 404 && (await hod2('POST', '/api/client-reports', { clientId: c1.data.id, date: TODAY, orders: 1 })).status === 404);
+    check('updates are validated', (await W1('POST', '/api/client-reports', { clientId: c1.data.id, date: ymd(offset(2)), orders: 1 })).status === 400 && (await W1('POST', '/api/client-reports', { clientId: c1.data.id, date: TODAY })).status === 400
+      && (await W1('POST', '/api/client-reports', { clientId: c1.data.id, date: TODAY, orders: -1 })).status === 400);
+    const ce1 = await W1('POST', '/api/client-reports', { clientId: c1.data.id, date: TODAY, market: 'Amazon US', store: 'Main', orders: 5, investment: 100, sales: 300, note: 'Listed 20 products, 2 orders shipped' });
+    const ce2 = await W2('POST', '/api/client-reports', { clientId: c1.data.id, date: TODAY, market: 'eBay UK', orders: 3, investment: 50, sales: 120 });
+    await W1('POST', '/api/client-reports', { clientId: c1.data.id, date: YESTERDAY, orders: 2, investment: 40, sales: 90, note: 'Quiet day' });
+    check('team members add the day\'s work for the client ID', ce1.status === 200 && ce2.status === 200);
+    const csales = (await CL('GET', '/api/portal/sales')).data;
+    check('TODAY: orders, investment, sales and revenue (sales - investment)', csales.today.orders === 8 && csales.today.investment === 150 && csales.today.sales === 420 && csales.today.revenue === 270, JSON.stringify(csales.today));
+    check('DAILY: one row per day with that day\'s updates', csales.days.length === 2 && csales.days[0].date === TODAY && csales.days[0].updates.length === 2 && csales.days[1].sales === 90 && csales.chart.length === 14);
+    check('TOTAL: everything so far', csales.total.orders === 10 && csales.total.investment === 190 && csales.total.sales === 510 && csales.total.revenue === 320 && csales.total.since === YESTERDAY);
+    const csalesJson = JSON.stringify(csales);
+    check('PRIVATE: the client never sees who wrote the numbers', !/Worker|submitted|by"|staff|employee/i.test(csalesJson) && csales.username === 'ali.traders' && csalesJson.includes('Listed 20 products'));
+    check('the client sees only its own numbers', (await CL2('GET', '/api/portal/sales')).data.total.orders === 0);
+    const stf = (await W2('GET', `/api/client-reports?clientId=${c1.data.id}&from=${YESTERDAY}&to=${TODAY}`)).data;
+    check('the team sees the entries with who wrote them (internal only)', stf.rows.length === 3 && stf.rows.some((r) => r.by === 'Worker One') && stf.totals.sales === 510);
+    check('a member edits only their own update; a leader or the admin any', (await W2('PUT', `/api/client-reports/${ce1.data.id}`, { date: TODAY, orders: 9 })).status === 403 && (await W1('PUT', `/api/client-reports/${ce1.data.id}`, { date: TODAY, market: 'Amazon US', orders: 6, investment: 100, sales: 360, note: 'Corrected' })).status === 200
+      && (await leaderA2('PUT', `/api/client-reports/${ce2.data.id}`, { date: TODAY, orders: 4, investment: 50, sales: 120 })).status === 200 && (await CL('GET', '/api/portal/sales')).data.today.orders === 10);
+    check('delete follows the same rule', (await W1('DELETE', `/api/client-reports/${ce2.data.id}`)).status === 403 && (await leaderA2('DELETE', `/api/client-reports/${ce2.data.id}`)).status === 200 && (await CL('GET', '/api/portal/sales')).data.today.orders === 6);
+    const ce3 = await bm('POST', '/api/client-reports', { clientId: c2.data.id, date: TODAY, orders: 7, sales: 70 });
+    check('a department-wide client gets updates from any team', ce3.status === 200 && (await CL2('GET', '/api/portal/sales')).data.today.orders === 7);
+    check('the client\'s Sales page is the Client Updates, not the sheet: sending a sheet changes nothing there', (await CL('GET', '/api/portal/sales')).data.today.orders === 6 && (await CL('GET', '/api/portal/sales')).data.total.orders === 8);
 
     console.log('Client chat (inquiry)');
     const note = async (c, re) => (await c('GET', '/api/notifications?limit=100')).data.items.filter((n) => re.test(n.title));
@@ -725,7 +741,9 @@ async function main() {
     check('only the chosen member, the head and the admin can open it; the rest of the team cannot', await see(W2) === 200 && await see(hodNew) === 200 && await see(admin) === 200 && await see(leaderA2) === 404 && await see(W1) === 404 && await see(bm) === 404);
     check('the rest of the team does not see it in lists, updates or alerts', !(await ids(W1)).includes('select.test') && !(await ids(leaderA2)).includes('select.test') && (await ids(W2)).includes('select.test')
       && (await W1('POST', '/api/orders', { clientId: c4.data.id, date: TODAY, orders: 1 })).status === 400 && (await W2('POST', '/api/orders', { clientId: c4.data.id, date: TODAY, orders: 2, revenue: 20 })).status === 200
-      && (await W1('GET', `/api/orders/me?client=${c4.data.id}`)).status === 400);
+      && (await W1('GET', `/api/orders/me?client=${c4.data.id}`)).status === 400
+      && (await W1('POST', '/api/client-reports', { clientId: c4.data.id, date: TODAY, orders: 1 })).status === 404 && (await W2('POST', '/api/client-reports', { clientId: c4.data.id, date: TODAY, orders: 2, sales: 20 })).status === 200
+      && (await W1('GET', `/api/client-reports?clientId=${c4.data.id}`)).data.rows.length === 0);
     const CL4 = client();
     await CL4('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'select.test', password: cpw });
     await CL4('POST', '/api/portal/chat', { channel: 'alert', body: 'Code 998877' });
@@ -850,7 +868,7 @@ async function main() {
       && (await S2('POST', '/api/orders', { date: TODAY, orders: 1, clientId: cs.data.id })).status === 400);
 
     console.log('Daily sheet: Update client sends one sheet, as it is');
-    check('the client sees nothing until the member presses Update', (await csheet()).sheets.length === 0 && (await CL6('GET', '/api/portal/sheet/stamp')).data.stamp === '' && (await CL6('GET', '/api/portal/sales')).data.currencies.length === 0);
+    check('the client sees nothing until the member presses Update', (await csheet()).sheets.length === 0 && (await CL6('GET', '/api/portal/sheet/stamp')).data.stamp === '');
     check('only team members and leaders can update a client, never the head, the client or a stranger', (await publish(hodNew, cs.data.id)).status === 403 && (await publish(CL6, cs.data.id)).status === 403 && (await publish(anon, cs.data.id)).status === 401);
     const pub1 = await publish(S1, cs.data.id);
     check('Update client sends a copy of that sheet and says it is up to date', pub1.status === 200 && pub1.data.rows === 3 && pub1.data.upToDate === true && (await sheetOf1()).published.find((p) => p.clientId === cs.data.id).upToDate === true);
@@ -862,9 +880,6 @@ async function main() {
     check('the other client\'s sheet is not mixed in', !JSON.stringify(v1).includes('T-1') && !JSON.stringify(v1).includes('wrong sheet'));
     check('PRIVATE: nothing tells the client who wrote it', !/Sheet One|employee|sh1/i.test(JSON.stringify(v1)) && !Object.keys(first).some((k) => /employee|client|id$/i.test(k.replace('orderId', ''))));
     check('the client is told, without any figure', (await note(CL6, /Your sheet was updated/)).length === 1 && !JSON.stringify((await CL6('GET', '/api/notifications?limit=100')).data).includes('internal remark'));
-    const sales6 = (await CL6('GET', '/api/portal/sales')).data;
-    check('the Sales page follows the sheet: today, every day, every month and the total, for each currency', sales6.currencies.map((c) => c.currency).sort().join() === 'AUD,GBP,USD' && sales6.currencies.find((c) => c.currency === 'USD').today.sales === 100 && sales6.currencies.find((c) => c.currency === 'AUD').total.sales === 200
-      && sales6.currencies.find((c) => c.currency === 'GBP').days.length === 1 && sales6.currencies.find((c) => c.currency === 'USD').months.length === 1);
     check('another client sees nothing of it; staff cannot open the client pages', !JSON.stringify(await csheet(CL2)).includes('ORD-1001') && (await S1('GET', '/api/portal/sheet')).status === 403 && (await anon('GET', '/api/portal/sheet')).status === 401 && (await S1('GET', '/api/portal/sheet/stamp')).status === 403);
     const stamp1 = (await CL6('GET', '/api/portal/sheet/stamp')).data.stamp;
     await S1('PUT', `/api/orders/${rUsd.data.id}`, { revenue: 150 });
