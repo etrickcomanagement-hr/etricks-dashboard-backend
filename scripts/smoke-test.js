@@ -24,12 +24,13 @@ function check(name, cond, extra = '') {
 
 function client() {
   const jar = new Map(); // a browser keeps every cookie (the session and the access password)
-  return async (method, url, body) => {
+  return async (method, url, body, extra = {}) => {
     const res = await fetch(BASE + url, {
-      method, headers: { 'Content-Type': 'application/json', 'X-Etricks': '1', ...(jar.size ? { Cookie: [...jar].map(([k, v]) => `${k}=${v}`).join('; ') } : {}) },
+      method, headers: { 'Content-Type': 'application/json', 'X-Etricks': '1', ...extra, ...(jar.size ? { Cookie: [...jar].map(([k, v]) => `${k}=${v}`).join('; ') } : {}) },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     for (const line of res.headers.getSetCookie()) { const kv = line.split(';')[0]; const i = kv.indexOf('='); jar.set(kv.slice(0, i), kv.slice(i + 1)); }
+    if (/^(image|audio)\//.test(res.headers.get('content-type') || '')) return { status: res.status, data: Buffer.from(await res.arrayBuffer()), headers: res.headers };
     const text = await res.text();
     let data; try { data = JSON.parse(text); } catch { data = text; }
     return { status: res.status, data, headers: res.headers };
@@ -915,17 +916,94 @@ async function main() {
     check('the member can stop showing the sheet to a client', (await S1('DELETE', `/api/orders/publish/${cs.data.id}`)).status === 200 && (await csheet()).sheets.length === 0 && (await S2('DELETE', `/api/orders/publish/${cs.data.id}`)).status === 200);
     await publish(S1, cs.data.id);
 
-    console.log('Daily sheet: one person works for at most 5 clients');
+    console.log('Daily sheet: one person works for at most 30 clients');
+    const have = (await admin('GET', `/api/clients/candidates?departmentId=${ebayId}&teamId=${tA}`)).data.find((e) => e.id === sh1.id).otherClients;
+    check('the limit is 30 clients per person', have >= 2 && have < 30 && (await admin('GET', `/api/clients/candidates?departmentId=${ebayId}&teamId=${tA}`)).data.find((e) => e.id === sh1.id).limit === 30);
     const lim = [];
-    for (const n of [1, 2, 3]) lim.push((await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [sh1.id], username: `limit.${n}`, password: cpw })).data);
-    const sixth = await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [sh1.id], username: 'limit.4', password: cpw });
-    check('a sixth client is refused with a clear message, and nothing is half-created', sixth.status === 400 && /already works for 5 clients/.test(sixth.data.error) && (await admin('GET', '/api/clients')).data.every((c) => c.username !== 'limit.4'));
+    for (let n = 1; n <= 30 - have; n++) lim.push((await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [sh1.id], username: `limit.${n}`, password: cpw })).data);
+    check('a person can be given clients all the way up to 30', lim.length === 30 - have && lim.every((c) => Number.isInteger(c.id)));
+    const over = await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [sh1.id], username: 'limit.over', password: cpw });
+    check('a 31st client is refused with a clear message, and nothing is half-created', over.status === 400 && /already works for 30 clients/.test(over.data.error) && (await admin('GET', '/api/clients')).data.every((c) => c.username !== 'limit.over'));
     const candSh1 = (await admin('GET', `/api/clients/candidates?departmentId=${ebayId}&teamId=${tA}`)).data.find((e) => e.id === sh1.id);
-    check('the list shows who is full', candSh1.otherClients === 5 && candSh1.limit === 5 && (await admin('GET', `/api/clients/${lim[0].id}/staff`)).data.candidates.find((e) => e.id === sh1.id).otherClients === 4);
-    const lim4 = await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [], username: 'limit.4', password: cpw });
-    check('adding the sixth later is refused too; keeping an existing client is fine', (await admin('PUT', `/api/clients/${lim4.data.id}/staff`, { employeeIds: [sh1.id] })).status === 400 && (await admin('PUT', `/api/clients/${lim[0].id}/staff`, { employeeIds: [sh1.id] })).status === 200 && (await admin('PUT', `/api/clients/${lim4.data.id}`, { staffIds: [sh1.id] })).status === 400);
-    check('after a client is taken away, the next one can be given', (await admin('PUT', `/api/clients/${lim[0].id}/staff`, { employeeIds: [] })).status === 200 && (await admin('PUT', `/api/clients/${lim4.data.id}/staff`, { employeeIds: [sh1.id] })).status === 200);
-    for (const c of [...lim, lim4.data]) await admin('DELETE', `/api/clients/${c.id}`);
+    check('the list shows who is full', candSh1.otherClients === 30 && candSh1.limit === 30 && (await admin('GET', `/api/clients/${lim[0].id}/staff`)).data.candidates.find((e) => e.id === sh1.id).otherClients === 29);
+    const sheetTabs = (await S1('GET', `/api/orders/me?${RANGE}&client=${lim[0].id}`)).data;
+    check('the member\'s daily sheet has one separate sheet per client, all 30, and each opens', sheetTabs.clients.length === 30 && (await S1('GET', `/api/orders/me?${RANGE}&client=${lim[lim.length - 1].id}`)).status === 200);
+    const limX = await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [], username: 'limit.over', password: cpw });
+    check('adding the 31st later is refused too; keeping an existing client is fine', (await admin('PUT', `/api/clients/${limX.data.id}/staff`, { employeeIds: [sh1.id] })).status === 400 && (await admin('PUT', `/api/clients/${lim[0].id}/staff`, { employeeIds: [sh1.id] })).status === 200 && (await admin('PUT', `/api/clients/${limX.data.id}`, { staffIds: [sh1.id] })).status === 400);
+    check('after a client is taken away, the next one can be given', (await admin('PUT', `/api/clients/${lim[0].id}/staff`, { employeeIds: [] })).status === 200 && (await admin('PUT', `/api/clients/${limX.data.id}/staff`, { employeeIds: [sh1.id] })).status === 200);
+    for (const c of [...lim, limX.data]) await admin('DELETE', `/api/clients/${c.id}`);
+
+    {
+    console.log('Client chat: pictures and voice notes');
+    const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(300, 7)]);
+    const ogg = Buffer.concat([Buffer.from('OggS'), Buffer.alloc(900, 3)]);
+    const webm = Buffer.concat([Buffer.from([0x1a, 0x45, 0xdf, 0xa3]), Buffer.alloc(900, 5)]);
+    const att = (buf) => ({ data: buf.toString('base64') });
+    const cf = (await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [sh1.id, la.data.id], username: 'files.test', password: cpw })).data;
+    const CF = client();
+    await CF('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'files.test', password: cpw });
+    const cfPost = (body, attachment, ch = 'inquiry') => CF('POST', '/api/portal/chat', { channel: ch, body, attachment });
+    const sPost = (c, body, attachment, ch = 'inquiry') => c('POST', `/api/clients/${cf.id}/chat`, { channel: ch, body, attachment });
+    const pic = await cfPost('', att(png));
+    check('the client sends a picture with no text', pic.status === 200 && (await cfPost('', undefined)).status === 400 && (await cfPost('', null)).status === 400);
+    const cfMsgs = (await CF('GET', '/api/portal/chat?channel=inquiry')).data.messages;
+    check('the message carries the file details but never the bytes', cfMsgs.length === 1 && cfMsgs[0].file.kind === 'image' && cfMsgs[0].file.mime === 'image/png' && cfMsgs[0].file.size === png.length && !JSON.stringify(cfMsgs).includes(png.toString('base64').slice(20, 60)));
+    const fileUrlC = `/api/portal/chat/files/${cfMsgs[0].file.id}`;
+    const gotC = await CF('GET', fileUrlC);
+    check('the client opens its own picture: same bytes, safe headers', gotC.status === 200 && Buffer.compare(gotC.data, png) === 0 && gotC.headers.get('content-type') === 'image/png' && gotC.headers.get('x-content-type-options') === 'nosniff' && /sandbox/.test(gotC.headers.get('content-security-policy')));
+    const staffMsgs = (await S1('GET', `/api/clients/${cf.id}/chat?channel=inquiry`)).data;
+    check('the team sees the picture and that the client waits for an answer', staffMsgs.messages[0].file.kind === 'image' && staffMsgs.needsReply === true);
+    const fileUrlS = `/api/clients/${cf.id}/chat/files/${staffMsgs.messages[0].file.id}`;
+    check('chosen staff, the head and the admin open it; a stranger does not', (await S1('GET', fileUrlS)).status === 200 && (await hodNew('GET', fileUrlS)).status === 200 && (await admin('GET', fileUrlS)).status === 200 && (await leaderB('GET', fileUrlS)).status === 404 && (await bm('GET', fileUrlS)).status === 404 && (await anon('GET', fileUrlS)).status === 401);
+    check('another client cannot open it, even knowing the number', (await CL2('GET', fileUrlC)).status === 404 && (await CL('GET', fileUrlC)).status === 404 && (await CL('GET', '/api/portal/chat/files/999999')).status === 404);
+    check('a file number of another client does not open through this client\'s chat', (await S1('GET', `/api/clients/${c1.data.id}/chat/files/${staffMsgs.messages[0].file.id}`)).status === 404);
+    const voice = await sPost(S1, '', att(ogg));
+    check('the team sends a voice note, no text needed; the client sees "eTricks", no name', voice.status === 200);
+    const cfMsgs2 = (await CF('GET', '/api/portal/chat?channel=inquiry')).data.messages;
+    check('the client gets the voice note as audio', cfMsgs2.length === 2 && cfMsgs2[1].file.kind === 'audio' && cfMsgs2[1].file.mime === 'audio/ogg' && cfMsgs2[1].from === 'etricks' && !/Sheet One|Lina/.test(JSON.stringify(cfMsgs2)));
+    const audioUrl = `/api/portal/chat/files/${cfMsgs2[1].file.id}`;
+    const part = await CF('GET', audioUrl, undefined, { Range: 'bytes=0-99' });
+    check('a voice note can be played and skipped through (byte ranges)', part.status === 206 && part.data.length === 100 && part.headers.get('content-range') === `bytes 0-99/${ogg.length}` && part.headers.get('accept-ranges') === 'bytes'
+      && (await CF('GET', audioUrl, undefined, { Range: 'bytes=-10' })).data.length === 10 && (await CF('GET', audioUrl, undefined, { Range: 'bytes=5000-' })).status === 416 && Buffer.compare((await CF('GET', audioUrl)).data, ogg) === 0);
+    check('picture and text together; webm voice notes work too', (await sPost(S1, 'Here is the screenshot', att(png))).status === 200 && (await cfPost('my voice', att(webm), 'alert')).status === 200
+      && (await CF('GET', '/api/portal/chat?channel=inquiry')).data.messages.at(-1).body === 'Here is the screenshot');
+    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"></svg>');
+    const html = Buffer.from('<html><script>alert(1)</script></html>');
+    const exe = Buffer.concat([Buffer.from('MZ'), Buffer.alloc(100)]);
+    check('nothing a browser could run is accepted: SVG, HTML, programs, or a file that only claims to be a picture', (await cfPost('x', att(svg))).status === 400 && (await cfPost('x', att(html))).status === 400 && (await cfPost('x', att(exe))).status === 400
+      && (await cfPost('x', { data: html.toString('base64'), mime: 'image/png' })).status === 400 && (await sPost(S1, 'x', att(svg))).status === 400);
+    check('a broken or empty attachment is refused', (await cfPost('x', { data: '!!!not base64!!!' })).status === 400 && (await cfPost('x', { data: '' })).status === 400 && (await cfPost('x', 'abc')).status === 400 && (await cfPost('x', { data: 'AAAA' })).status === 400);
+    const bigImg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(4 * 1024 * 1024 + 10, 1)]);
+    const bigAud = Buffer.concat([Buffer.from('OggS'), Buffer.alloc(3 * 1024 * 1024 + 10, 1)]);
+    check('too big is refused with a clear message (picture 4 MB, voice 3 MB)', /too big/.test((await cfPost('x', att(bigImg))).data.error) && /voice note is too big/.test((await cfPost('x', att(bigAud))).data.error) && (await sPost(S1, 'x', att(bigImg))).status === 400);
+    check('a huge request is cut off', (await cfPost('x', { data: 'A'.repeat(9_000_000) })).status === 413);
+    check('after all that refusing, the chat is intact (4 good messages, nothing half-saved)', (await S1('GET', `/api/clients/${cf.id}/chat?channel=inquiry`)).data.messages.length === 3 && (await S1('GET', `/api/clients/${cf.id}/chat?channel=alert`)).data.messages.length === 1);
+    check('no file bytes and no text in notifications or the activity log', !JSON.stringify((await admin('GET', '/api/notifications?limit=100')).data).includes('screenshot') && !JSON.stringify((await admin('GET', '/api/logs?limit=500')).data).includes('screenshot')
+      && (await admin('GET', '/api/logs?limit=500')).data.some((l) => /files\.test \(image\)/.test(l.details || '')) && (await admin('GET', '/api/logs?limit=500')).data.some((l) => /files\.test \(audio\)/.test(l.details || '')));
+    // the conversation turns private to the first colleague who answered (Sheet One); the admin still sees everything
+    check('PRIVATE chat: the owner and the admin open the files; the leader and the head do not', (await S1('GET', fileUrlS)).status === 200 && (await admin('GET', fileUrlS)).status === 200 && (await leaderA2('GET', fileUrlS)).status === 403 && (await hodNew('GET', fileUrlS)).status === 403);
+    const adminRowCf = (await admin('GET', '/api/clients')).data.find((c) => c.id === cf.id);
+    const adminThread = (await admin('GET', `/api/clients/${cf.id}/chat?channel=inquiry`)).data;
+    check('ADMIN sees every conversation, also the private ones: the messages, the files and who answers', adminRowCf.chat === 'colleague' && adminRowCf.chatOwnerName === 'Sheet One' && adminRowCf.lastInquiryAt && adminThread.messages.length === 3 && adminThread.messages.some((m) => m.file && m.file.kind === 'audio')
+      && (await admin('GET', `/api/clients/${cf.id}/chat?channel=alert`)).data.messages.length === 1 && (await admin('GET', '/api/client-alerts/summary')).data.alerts >= 1);
+    check('the others still do not see the chat in lists', (await leaderA2('GET', '/api/clients')).data.find((c) => c.id === cf.id).lastInquiryAt === null);
+    const { DatabaseSync } = require('node:sqlite');
+    const peek = new DatabaseSync(path.join(DATA, 'etricks.db'));
+    const stored = Number(peek.prepare('SELECT COUNT(*) AS n FROM chat_attachments WHERE client_id=?').get(cf.id).n);
+    peek.close();
+    check('the files are stored in the database (so every backup holds them)', stored === 4, String(stored));
+    // limits per hour
+    let sent = 0, refused = null;
+    for (let n = 0; n < 40 && !refused; n++) { const r = await cfPost('', att(png)); if (r.status === 200) sent++; else refused = r; }
+    check('a client cannot flood the chat with files: at most 30 an hour', refused && refused.status === 429 && /Too many files/.test(refused.data.error) && sent >= 20 && sent <= 30, `${sent} ${refused && refused.status}`);
+    check('the admin can wipe a chat, and its files go with it', (await admin('DELETE', `/api/clients/${cf.id}/chat?channel=inquiry`)).status === 200 && (await admin('GET', fileUrlS)).status === 404 && (await CF('GET', fileUrlC)).status === 404 && (await CF('GET', '/api/portal/chat?channel=inquiry')).data.messages.length === 0);
+    const peek2 = new DatabaseSync(path.join(DATA, 'etricks.db'));
+    const left = Number(peek2.prepare('SELECT COUNT(*) AS n FROM chat_attachments WHERE client_id=?').get(cf.id).n);
+    check('only the alert chat\'s file is left in the database', left === 1, String(left));
+    check('deleting the client deletes every file of it', (await admin('DELETE', `/api/clients/${cf.id}`)).status === 200 && Number(peek2.prepare('SELECT COUNT(*) AS n FROM chat_attachments WHERE client_id=?').get(cf.id).n) === 0);
+    peek2.close();
+
+    }
 
     check('removing a client keeps the member\'s rows (they move to the general sheet) and removes the copy', (await admin('DELETE', `/api/clients/${cs2.data.id}`)).status === 200 && (await S1('GET', `/api/orders/me?${RANGE}&client=general`)).data.rows.length === 1 && (await S1('GET', `/api/orders/me?${RANGE}&client=general`)).data.hasGeneral === true);
     check('what the client was sent stays when the person who wrote it is deleted; the member\'s own rows go', (await leaderA2('DELETE', `/api/employees/${sh1.id}`)).status === 200 && (await csheet()).sheets.length === 1 && (await csheet()).sheets[0].rows.length === 3 && (await admin('GET', `/api/orders?${RANGE}&search=Sheet One`)).data.rows.length === 0);
@@ -1087,7 +1165,8 @@ async function main() {
         const people = Number(t.prepare('SELECT COUNT(*) AS n FROM employees').get().n);
         const depts = Number(t.prepare('SELECT COUNT(*) AS n FROM departments').get().n);
         const sha = crypto.createHash('sha256').update(fbCopy).digest('hex');
-        return ok && people > 5 && depts === 6 && sha === fbNew.data.sha256;
+        const hasFiles = Number(t.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name='chat_attachments'").get().n) === 1; // pictures and voice notes are inside the database, so inside every backup
+        return ok && people > 5 && depts === 6 && sha === fbNew.data.sha256 && hasFiles;
       } finally { t.close(); fs.unlinkSync(tmp); }
     })());
     check('after downloading, the admin can delete it from the server (the file goes, the history stays)', (await admin('DELETE', `/api/backups/full/${fbId}`)).status === 200 && !fs.existsSync(path.join(DATA, 'backups', 'full', fbNew.data.name))

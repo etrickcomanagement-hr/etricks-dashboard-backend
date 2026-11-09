@@ -33,7 +33,7 @@ function securityHeaders(res) {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader(
     'Content-Security-Policy',
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
   );
 }
 
@@ -49,13 +49,17 @@ function parseCookies(header = '') {
 function readBody(req, limit = 1_000_000) {
   return new Promise((resolve, reject) => {
     let size = 0;
+    let tooBig = false;
     const chunks = [];
     req.on('data', (c) => {
       size += c.length;
-      if (size > limit) { reject(new HttpError(413, 'Request too large')); req.destroy(); return; }
+      // A request over the limit is read to its end (and thrown away) so the sender gets a proper "too large" answer;
+      // one that goes on far beyond the limit is cut off.
+      if (size > limit) { tooBig = true; chunks.length = 0; if (size > limit * 4 + 1_000_000) { reject(new HttpError(413, 'Request too large')); req.destroy(); } return; }
       chunks.push(c);
     });
     req.on('end', () => {
+      if (tooBig) return reject(new HttpError(413, 'Request too large'));
       if (!chunks.length) return resolve({});
       try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch { reject(new HttpError(400, 'Invalid JSON')); }
     });

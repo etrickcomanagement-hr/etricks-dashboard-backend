@@ -3,6 +3,7 @@ const auth = require('../../core/auth');
 const accounts = require('../../core/accounts');
 const db = require('../../core/db');
 const notify = require('../../core/notify');
+const attachments = require('../../core/attachments');
 const { HttpError, str, int, num, date, oneOf, bad, today, addDays, round } = require('../../core/util');
 
 /*
@@ -117,7 +118,7 @@ function chatRecipients(c) {
 
 // Who the admin can pick from: the leader and members of the team (or of the department when the client has no team).
 // One person can work for at most this many clients (each client is a separate sheet of that person).
-const MAX_CLIENTS_PER_PERSON = 5;
+const MAX_CLIENTS_PER_PERSON = 30;
 
 // `otherClients` = how many OTHER clients the person already works for (so the list can show who is full).
 function candidates(departmentId, teamId, exceptClientId = null) {
@@ -164,8 +165,16 @@ function lastMessages(clientIds) {
 }
 
 // What the client sees of a message: "eTricks" or "You". Never a staff name or ID.
-const toClientMessage = (m) => ({ id: m.id, from: m.fromClient ? 'you' : 'etricks', body: m.body, createdAt: m.createdAt, seen: !!m.readAt });
-const toStaffMessage = (m) => ({ id: m.id, fromClient: !!m.fromClient, author: m.fromClient ? 'Client' : m.staffLabel || 'Team', body: m.body, createdAt: m.createdAt, seen: !!m.readAt });
+// The pictures and voice notes of some messages (id, kind, type, size: never the bytes).
+const filesOf = (rows) => {
+  const ids = rows.map((m) => m.id);
+  const out = new Map();
+  if (!ids.length) return out;
+  for (const a of db.all(`SELECT id, message_id, kind, mime, size FROM chat_attachments WHERE message_id IN (${ids.map(() => '?').join(',')})`, ...ids)) out.set(a.messageId, { id: a.id, kind: a.kind, mime: a.mime, size: a.size });
+  return out;
+};
+const toClientMessage = (m, files) => ({ id: m.id, from: m.fromClient ? 'you' : 'etricks', body: m.body, createdAt: m.createdAt, seen: !!m.readAt, file: files?.get(m.id) ?? null });
+const toStaffMessage = (m, files) => ({ id: m.id, fromClient: !!m.fromClient, author: m.fromClient ? 'Client' : m.staffLabel || 'Team', body: m.body, createdAt: m.createdAt, seen: !!m.readAt, file: files?.get(m.id) ?? null });
 
 function nextUsername() {
   const n = (db.get('SELECT COALESCE(MAX(id),0)+1 AS n FROM clients').n);
@@ -226,6 +235,11 @@ module.exports = {
       WHERE client_id IS NULL AND (SELECT COUNT(*) FROM client_staff s JOIN clients c ON c.id=s.client_id WHERE s.employee_id=member_orders.employee_id AND c.status='active') = 1;
      UPDATE order_columns SET client_id = (SELECT s.client_id FROM client_staff s JOIN clients c ON c.id=s.client_id WHERE s.employee_id=order_columns.employee_id AND c.status='active')
       WHERE client_id IS NULL AND (SELECT COUNT(*) FROM client_staff s JOIN clients c ON c.id=s.client_id WHERE s.employee_id=order_columns.employee_id AND c.status='active') = 1;`,
+    // 6: pictures and voice notes in the chat. Stored in the database (so they are in every backup) and removed together with their message.
+    `CREATE TABLE chat_attachments (
+       id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL UNIQUE REFERENCES client_messages(id) ON DELETE CASCADE,
+       client_id INTEGER NOT NULL, kind TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL, data BLOB NOT NULL, created_at TEXT NOT NULL);
+     CREATE INDEX idx_chatatt_client ON chat_attachments(client_id);`,
   ],
 
   routes(m) {
@@ -436,15 +450,18 @@ module.exports = {
       // the client sees that their messages were read (by "eTricks": not by whom)
       db.run('UPDATE client_messages SET read_at=? WHERE client_id=? AND channel=? AND from_client=1 AND read_at IS NULL', new Date().toISOString(), c.id, channel);
       const last = db.get('SELECT from_client FROM client_messages WHERE client_id=? AND channel=? ORDER BY id DESC LIMIT 1', c.id, channel);
-      return { client: { id: c.id, username: c.username }, messages: rows.map(toStaffMessage), needsReply: !!last?.fromClient, ...chatInfo(ctx, c) };
+      const files = filesOf(rows);
+      return { client: { id: c.id, username: c.username }, messages: rows.map((r) => toStaffMessage(r, files)), needsReply: !!last?.fromClient, ...chatInfo(ctx, c) };
     });
 
-    m.post('/api/clients/:id/chat', { roles: STAFF }, (ctx) => {
+    m.post('/api/clients/:id/chat', { roles: STAFF, maxBody: attachments.MAX_BODY }, (ctx) => {
       const c = staffClient(ctx, ctx.params.id);
       chatGate(ctx, c);
       if (c.status !== 'active') throw bad('This client is disabled');
       const channel = oneOf(ctx.body.channel, 'Channel', CHANNELS, { required: true });
-      const body = str(ctx.body.body, 'Message', { required: true, max: 2000 });
+      const file = attachments.parse(ctx.body.attachment);
+      const body = str(ctx.body.body, 'Message', { required: !file, max: 2000 }) ?? '';
+      if (file && db.get('SELECT COUNT(*) AS n FROM chat_attachments WHERE client_id=? AND created_at>=? AND message_id IN (SELECT id FROM client_messages WHERE from_client=0)', c.id, new Date(Date.now() - 3600e3).toISOString()).n >= 60) throw new HttpError(429, 'Too many files in the last hour. Please wait a little.');
       // the first person to answer becomes the owner of the conversation (the admin only steps in, so does not take it)
       if (ctx.user.role !== 'admin' && !chatOwner(c)) {
         db.run('UPDATE clients SET chat_owner_id=? WHERE id=?', ctx.user.employeeId, c.id);
@@ -452,13 +469,26 @@ module.exports = {
       }
       const label = ctx.user.role === 'admin' ? 'Administrator' : db.get('SELECT name, role FROM employees WHERE id=?', ctx.user.employeeId);
       const who = typeof label === 'string' ? label : label.name;
-      const r = db.insert('client_messages', { clientId: c.id, channel, fromClient: 0, staffId: ctx.user.employeeId ?? null, staffLabel: who, body, createdAt: new Date().toISOString() });
-      ctx.audit(channel === 'alert' ? 'client_alert_sent' : 'client_message_sent', 'client', c.id, c.username, c.departmentId); // never the text
+      const now = new Date().toISOString();
+      const r = db.tx(() => {
+        const msg = db.insert('client_messages', { clientId: c.id, channel, fromClient: 0, staffId: ctx.user.employeeId ?? null, staffLabel: who, body, createdAt: now });
+        if (file) db.insert('chat_attachments', { messageId: msg.id, clientId: c.id, kind: file.kind, mime: file.mime, size: file.size, data: file.data, createdAt: now });
+        return msg;
+      });
+      ctx.audit(channel === 'alert' ? 'client_alert_sent' : 'client_message_sent', 'client', c.id, file ? `${c.username} (${file.kind})` : c.username, c.departmentId); // never the text
       // The text is never put into a notification: an alert may carry a code or a secret.
       notify.send({ clientId: c.id }, channel === 'alert'
         ? { title: 'URGENT: eTricks needs your attention now', body: 'Open the Alerts section of your portal.', link: '#/portal-alerts', kind: 'alert', urgent: true }
         : { title: 'New message from eTricks', link: '#/portal-chat', kind: 'chat' });
       return { id: r.id };
+    });
+
+    m.get('/api/clients/:id/chat/files/:fid', { roles: STAFF }, (ctx) => {
+      const c = staffClient(ctx, ctx.params.id);
+      chatGate(ctx, c);
+      const a = db.get('SELECT * FROM chat_attachments WHERE id=? AND client_id=?', int(ctx.params.fid, 'File', { required: true }), c.id);
+      if (!a) throw new HttpError(404, 'File not found');
+      return attachments.serve(ctx, a);
     });
 
     // The owner (or the admin) gives the conversation back: the chosen people can answer it again.
@@ -555,17 +585,31 @@ module.exports = {
       const after = Number(ctx.query.after) || 0;
       const rows = db.all('SELECT * FROM client_messages WHERE client_id=? AND channel=? AND id>? ORDER BY id DESC LIMIT 300', ctx.user.clientId, channel, after).reverse();
       db.run('UPDATE client_messages SET read_at=? WHERE client_id=? AND channel=? AND from_client=0 AND read_at IS NULL', new Date().toISOString(), ctx.user.clientId, channel);
-      return { messages: rows.map(toClientMessage) };
+      const files = filesOf(rows);
+      return { messages: rows.map((r) => toClientMessage(r, files)) };
     });
 
-    m.post('/api/portal/chat', { roles: CLIENT }, (ctx) => {
+    m.get('/api/portal/chat/files/:fid', { roles: CLIENT }, (ctx) => {
+      const a = db.get('SELECT * FROM chat_attachments WHERE id=? AND client_id=?', int(ctx.params.fid, 'File', { required: true }), ctx.user.clientId);
+      if (!a) throw new HttpError(404, 'File not found');
+      return attachments.serve(ctx, a);
+    });
+
+    m.post('/api/portal/chat', { roles: CLIENT, maxBody: attachments.MAX_BODY }, (ctx) => {
       const c = me(ctx);
       const channel = oneOf(ctx.body.channel, 'Channel', CHANNELS, { required: true });
-      const body = str(ctx.body.body, 'Message', { required: true, max: 2000 });
+      const file = attachments.parse(ctx.body.attachment);
+      const body = str(ctx.body.body, 'Message', { required: !file, max: 2000 }) ?? '';
       const hour = new Date(Date.now() - 3600e3).toISOString();
+      if (file && db.get('SELECT COUNT(*) AS n FROM chat_attachments WHERE client_id=? AND created_at>=? AND message_id IN (SELECT id FROM client_messages WHERE from_client=1)', c.id, hour).n >= 30) throw new HttpError(429, 'Too many files in the last hour. Please wait a little.');
       if (db.get('SELECT COUNT(*) AS n FROM client_messages WHERE client_id=? AND from_client=1 AND created_at>=?', c.id, hour).n >= 120) throw new HttpError(429, 'Too many messages in the last hour. Please wait a little.');
-      const r = db.insert('client_messages', { clientId: c.id, channel, fromClient: 1, body, createdAt: new Date().toISOString() });
-      ctx.audit(channel === 'alert' ? 'client_alert' : 'client_message', 'client', c.id, c.username, c.departmentId); // never the text
+      const now = new Date().toISOString();
+      const r = db.tx(() => {
+        const msg = db.insert('client_messages', { clientId: c.id, channel, fromClient: 1, body, createdAt: now });
+        if (file) db.insert('chat_attachments', { messageId: msg.id, clientId: c.id, kind: file.kind, mime: file.mime, size: file.size, data: file.data, createdAt: now });
+        return msg;
+      });
+      ctx.audit(channel === 'alert' ? 'client_alert' : 'client_message', 'client', c.id, file ? `${c.username} (${file.kind})` : c.username, c.departmentId); // never the text
       const payload = channel === 'alert'
         ? { title: `ALERT from client ${c.username}`, body: 'Needs an immediate reply.', link: '#/client-alerts', kind: 'alert', urgent: true }
         : { title: `New message from client ${c.username}`, link: '#/client-chat', kind: 'chat' };
