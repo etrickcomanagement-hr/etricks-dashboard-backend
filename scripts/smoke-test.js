@@ -700,8 +700,6 @@ async function main() {
     check('the client sees that the message was read, the thread is no longer waiting', threadC.messages[0].seen === true && (await W1('GET', '/api/clients')).data.find((c) => c.id === c1.data.id).inquiryNeedsReply === false);
     check('the client is notified of the reply without its text', (await note(CL, /New message from eTricks/)).length === 1 && !JSON.stringify((await CL('GET', '/api/notifications')).data).includes('checking now'));
     check('the admin sees which colleague answered', (await admin('GET', `/api/clients/${c1.data.id}/chat?channel=inquiry`)).data.messages[1].author === 'Worker Two');
-    const free = () => admin('PUT', `/api/clients/${c1.data.id}/chat-owner`, { employeeId: null }); // the first reply made Worker Two the owner: give it back for the whole-team checks below
-    await free();
     check('long polling: only new messages after an ID', (await CL('GET', `/api/portal/chat?channel=inquiry&after=${threadC.messages[1].id}`)).data.messages.length === 0);
 
     console.log('Client alerts (urgent)');
@@ -716,7 +714,6 @@ async function main() {
     check('the answer clears the alert', (await W2('POST', `/api/clients/${c1.data.id}/chat`, { channel: 'alert', body: 'Received, thank you.' })).status === 200 && (await W1('GET', '/api/client-alerts/summary')).data.alerts === 0);
     check('the client gets an urgent alert notification (no text) and it shows as unread', (await note(CL, /URGENT: eTricks needs your attention/)).length === 1 && !JSON.stringify((await CL('GET', '/api/notifications?limit=100')).data).includes('Received, thank you') && (await CL('GET', '/api/portal/summary')).data.alert === 1);
     check('opening the alerts marks them read', (await CL('GET', '/api/portal/chat?channel=alert')).data.messages.length === 2 && (await CL('GET', '/api/portal/summary')).data.alert === 0);
-    await free(); // Worker Two answered the alert, so it was theirs
     await W1('POST', `/api/clients/${c1.data.id}/chat`, { channel: 'alert', body: 'Please send the OTP code now' });
     check('the team can raise an alert to the client (e.g. to ask for a code)', (await CL('GET', '/api/portal/summary')).data.alert === 1 && (await CL('GET', '/api/portal/chat?channel=alert')).data.messages[2].from === 'etricks');
     check('the two chats are separate', (await CL('GET', '/api/portal/chat?channel=inquiry')).data.messages.length === 2 && (await CL2('GET', '/api/portal/chat?channel=alert')).data.messages.length === 0 && (await CL2('GET', '/api/portal/chat?channel=inquiry')).data.messages.length === 0);
@@ -758,44 +755,35 @@ async function main() {
     check('changing the people is written to the activity log', (await admin('GET', '/api/logs?limit=500')).data.some((l) => l.action === 'client_team_changed'));
     await admin('DELETE', `/api/clients/${c4.data.id}`);
 
-    console.log('Private chat: only the person who answers (and the admin) sees it');
-    const c5 = await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [la.data.id, w1.data.id, w2.data.id], username: 'private.test', password: cpw });
+    console.log('Chat of a client: everybody chosen reads and writes, nobody "owns" it');
+    const c5 = await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [la.data.id, w1.data.id, w2.data.id], username: 'shared.test', password: cpw });
     const CL5 = client();
-    await CL5('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'private.test', password: cpw });
+    await CL5('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'shared.test', password: cpw });
     const url5 = (ch = 'inquiry') => `/api/clients/${c5.data.id}/chat?channel=${ch}`;
     const post5 = (c, body, ch = 'inquiry') => c('POST', `/api/clients/${c5.data.id}/chat`, { channel: ch, body });
     const code5 = async (c) => (await c('GET', url5())).status;
-    const re5 = /client private.test/;
+    const re5 = /client shared.test/;
     await CL5('POST', '/api/portal/chat', { channel: 'inquiry', body: 'Hello, are you there?' });
-    check('before anyone answers, every chosen person (and the head) can open the chat', await code5(W1) === 200 && await code5(W2) === 200 && await code5(leaderA2) === 200 && await code5(hodNew) === 200 && await code5(admin) === 200 && await code5(bm) === 404);
-    check('reading does not take the chat; the admin writing does not either', (await post5(admin, 'Admin here')).status === 200 && await code5(W1) === 200 && (await W1('GET', '/api/clients')).data.find((c) => c.id === c5.data.id).chat === 'open');
-    check('the first colleague who replies owns the conversation', (await post5(W2, 'Hi, how can I help?')).status === 200 && (await W2('GET', '/api/clients')).data.find((c) => c.id === c5.data.id).chat === 'mine');
-    check('PRIVATE: nobody else can read it: not a teammate, the leader or the head', await code5(W1) === 403 && await code5(leaderA2) === 403 && await code5(hodNew) === 403 && await code5(W2) === 200 && await code5(admin) === 200);
-    check('PRIVATE: nobody else can write into it', (await post5(W1, 'I will answer')).status === 403 && (await post5(leaderA2, 'I will answer')).status === 403 && (await post5(hodNew, 'I will answer')).status === 403);
-    const asW1 = (await W1('GET', '/api/clients')).data.find((c) => c.id === c5.data.id);
-    check('the others still see the client, but nothing of its chat', !!asW1 && asW1.chat === 'colleague' && asW1.inquiryNeedsReply === false && asW1.lastInquiryAt === null && !JSON.stringify(asW1).includes('Hello'));
-    const adminRow = (await admin('GET', '/api/clients')).data.find((c) => c.id === c5.data.id);
-    check('the admin sees who answers', adminRow.chat === 'colleague' && adminRow.chatOwnerName === 'Worker Two');
-    const n0 = { w1: (await note(W1, re5)).length, la: (await note(leaderA2, re5)).length, hod: (await note(hodNew, re5)).length, w2: (await note(W2, re5)).length, ad: (await note(admin, re5)).length };
+    check('every chosen person, the head and the admin open the chat; people who are not chosen do not', await code5(W1) === 200 && await code5(W2) === 200 && await code5(leaderA2) === 200 && await code5(hodNew) === 200 && await code5(admin) === 200 && await code5(bm) === 404 && await code5(leaderB) === 404 && await code5(hod2) === 404);
+    check('one answers and nobody is locked out: the others still read the chat', (await post5(W2, 'Hi, how can I help?')).status === 200 && await code5(W1) === 200 && await code5(leaderA2) === 200 && await code5(hodNew) === 200 && await code5(admin) === 200 && await code5(W2) === 200);
+    check('and the others can write too, as often as they like, in the same conversation', (await post5(W1, 'I add something')).status === 200 && (await post5(leaderA2, 'Leader here')).status === 200 && (await post5(hodNew, 'Head here')).status === 200 && (await post5(admin, 'Admin here')).status === 200 && (await post5(W2, 'And again')).status === 200 && (await post5(W2, 'And once more')).status === 200);
+    const seen5 = (await W1('GET', url5())).data.messages;
+    check('everybody sees the same 8 messages, each with the name of the colleague (for the team only)', seen5.length === 8 && seen5.map((m) => m.author).join() === 'Client,Worker Two,Worker One,Lina Lead,Hamza Head,Administrator,Worker Two,Worker Two'
+      && (await W2('GET', url5())).data.messages.length === 8 && (await hodNew('GET', url5())).data.messages.length === 8 && (await leaderA2('GET', url5())).data.messages.length === 8);
+    check('the list shows everybody the same: no owner, no hidden chat', (await W1('GET', '/api/clients')).data.find((c) => c.id === c5.data.id).lastInquiryAt === (await admin('GET', '/api/clients')).data.find((c) => c.id === c5.data.id).lastInquiryAt
+      && !JSON.stringify((await admin('GET', '/api/clients')).data).includes('chatOwner') && (await W1('GET', '/api/clients')).data.find((c) => c.id === c5.data.id).chat === undefined);
+    const n0 = { w1: (await note(W1, re5)).length, la: (await note(leaderA2, re5)).length, hod: (await note(hodNew, re5)).length, w2: (await note(W2, re5)).length, ad: (await note(admin, re5)).length, bm: (await note(bm, re5)).length, lb: (await note(leaderB, re5)).length };
     await CL5('POST', '/api/portal/chat', { channel: 'inquiry', body: 'Second question' });
     await CL5('POST', '/api/portal/chat', { channel: 'alert', body: 'Code 774411' });
-    check('the client\'s new messages and alerts notify only the owner and the admin', (await note(W2, re5)).length === n0.w2 + 2 && (await note(admin, re5)).length === n0.ad + 2
-      && (await note(W1, re5)).length === n0.w1 && (await note(leaderA2, re5)).length === n0.la && (await note(hodNew, re5)).length === n0.hod);
-    check('PRIVATE: the others get no alert banner, no waiting count and cannot open the alert chat', (await W1('GET', '/api/client-alerts/summary')).data.items.every((i) => i.username !== 'private.test') && (await W1('GET', '/api/client-alerts/summary')).data.inquiries === 0
-      && (await W2('GET', '/api/client-alerts/summary')).data.items.some((i) => i.username === 'private.test') && (await W1('GET', url5('alert'))).status === 403 && (await hodNew('GET', url5('alert'))).status === 403);
-    check('the client still sees one chat, written by "eTricks"', (await CL5('GET', '/api/portal/chat?channel=inquiry')).data.messages.length === 4 && !/Worker|Lina/.test(JSON.stringify((await CL5('GET', '/api/portal/chat?channel=inquiry')).data)));
-    check('only the owner or the admin can release it', (await W1('POST', `/api/clients/${c5.data.id}/chat/release`, {})).status === 403 && (await hodNew('POST', `/api/clients/${c5.data.id}/chat/release`, {})).status === 403
-      && (await W2('POST', `/api/clients/${c5.data.id}/chat/release`, {})).status === 200 && await code5(W1) === 200);
-    check('after the release the next person who replies owns it, and the first one is locked out', (await post5(W1, 'I take it')).status === 200 && await code5(W2) === 403 && await code5(W1) === 200);
-    check('only the admin hands it to someone, and only to a person of this client', (await W1('PUT', `/api/clients/${c5.data.id}/chat-owner`, { employeeId: w2.data.id })).status === 403
-      && (await admin('PUT', `/api/clients/${c5.data.id}/chat-owner`, { employeeId: bina.data.id })).status === 400
-      && (await admin('PUT', `/api/clients/${c5.data.id}/chat-owner`, { employeeId: w2.data.id })).status === 200 && await code5(W2) === 200 && await code5(W1) === 403 && (await note(W2, /You now answer client private.test/)).length === 1);
-    check('the head can take a chat too (and then the team cannot read it)', (await admin('PUT', `/api/clients/${c5.data.id}/chat-owner`, { employeeId: null })).status === 200 && (await post5(hodNew, 'Head here')).status === 200 && await code5(W2) === 403 && await code5(hodNew) === 200);
-    await admin('PUT', `/api/clients/${c5.data.id}/chat-owner`, { employeeId: null });
-    await post5(W2, 'Back to Worker Two');
-    check('an owner who is taken off the client no longer locks the chat', (await admin('PUT', `/api/clients/${c5.data.id}/staff`, { employeeIds: [la.data.id, w1.data.id] })).status === 200 && await code5(W1) === 200 && await code5(W2) === 404);
+    check('the client\'s messages and alerts notify everybody who works with the client, and nobody else', (await note(W2, re5)).length === n0.w2 + 2 && (await note(W1, re5)).length === n0.w1 + 2 && (await note(leaderA2, re5)).length === n0.la + 2 && (await note(hodNew, re5)).length === n0.hod + 2 && (await note(admin, re5)).length === n0.ad + 2
+      && (await note(bm, re5)).length === n0.bm && (await note(leaderB, re5)).length === n0.lb);
+    check('the alert is shown to all of them: banner, waiting count, and everybody can open the alert chat and answer it', (await W1('GET', '/api/client-alerts/summary')).data.items.some((i) => i.username === 'shared.test') && (await W2('GET', '/api/client-alerts/summary')).data.items.some((i) => i.username === 'shared.test')
+      && (await hodNew('GET', '/api/client-alerts/summary')).data.items.some((i) => i.username === 'shared.test') && (await W1('GET', url5('alert'))).status === 200 && (await hodNew('GET', url5('alert'))).status === 200 && (await post5(W1, 'Received the code', 'alert')).status === 200 && (await post5(W2, 'Thank you', 'alert')).status === 200);
+    check('the client sees one chat, written by "eTricks", never a name', (await CL5('GET', '/api/portal/chat?channel=inquiry')).data.messages.length === 9 && !/Worker|Lina|Hamza/.test(JSON.stringify((await CL5('GET', '/api/portal/chat?channel=inquiry')).data)));
+    check('the old owner system is gone: no release, no hand-over, no chat owner anywhere', (await W2('POST', `/api/clients/${c5.data.id}/chat/release`, {})).status === 404 && (await admin('PUT', `/api/clients/${c5.data.id}/chat-owner`, { employeeId: w2.data.id })).status === 404);
+    check('a person taken off the client loses its chat at once; the others keep it', (await admin('PUT', `/api/clients/${c5.data.id}/staff`, { employeeIds: [la.data.id, w1.data.id] })).status === 200 && await code5(W1) === 200 && await code5(W2) === 404 && (await post5(W2, 'still here?')).status === 404 && await code5(leaderA2) === 200);
     const acts = (await admin('GET', '/api/logs?limit=500')).data.map((l) => l.action);
-    check('the changes of who answers are in the activity log', ['client_chat_taken', 'client_chat_released', 'client_chat_assigned'].every((a) => acts.includes(a)));
+    check('answering is logged without the text; nothing is "taken" any more', acts.includes('client_message_sent') && !acts.includes('client_chat_taken'));
     await admin('DELETE', `/api/clients/${c5.data.id}`);
 
     console.log('Daily sheet: currencies, own columns, clients and live views');
@@ -980,13 +968,12 @@ async function main() {
     check('after all that refusing, the chat is intact (4 good messages, nothing half-saved)', (await S1('GET', `/api/clients/${cf.id}/chat?channel=inquiry`)).data.messages.length === 3 && (await S1('GET', `/api/clients/${cf.id}/chat?channel=alert`)).data.messages.length === 1);
     check('no file bytes and no text in notifications or the activity log', !JSON.stringify((await admin('GET', '/api/notifications?limit=100')).data).includes('screenshot') && !JSON.stringify((await admin('GET', '/api/logs?limit=500')).data).includes('screenshot')
       && (await admin('GET', '/api/logs?limit=500')).data.some((l) => /files\.test \(image\)/.test(l.details || '')) && (await admin('GET', '/api/logs?limit=500')).data.some((l) => /files\.test \(audio\)/.test(l.details || '')));
-    // the conversation turns private to the first colleague who answered (Sheet One); the admin still sees everything
-    check('PRIVATE chat: the owner and the admin open the files; the leader and the head do not', (await S1('GET', fileUrlS)).status === 200 && (await admin('GET', fileUrlS)).status === 200 && (await leaderA2('GET', fileUrlS)).status === 403 && (await hodNew('GET', fileUrlS)).status === 403);
+    check('everybody chosen, the head and the admin open the files; others do not', (await S1('GET', fileUrlS)).status === 200 && (await admin('GET', fileUrlS)).status === 200 && (await leaderA2('GET', fileUrlS)).status === 200 && (await hodNew('GET', fileUrlS)).status === 200 && (await bm('GET', fileUrlS)).status === 404);
     const adminRowCf = (await admin('GET', '/api/clients')).data.find((c) => c.id === cf.id);
     const adminThread = (await admin('GET', `/api/clients/${cf.id}/chat?channel=inquiry`)).data;
-    check('ADMIN sees every conversation, also the private ones: the messages, the files and who answers', adminRowCf.chat === 'colleague' && adminRowCf.chatOwnerName === 'Sheet One' && adminRowCf.lastInquiryAt && adminThread.messages.length === 3 && adminThread.messages.some((m) => m.file && m.file.kind === 'audio')
+    check('the ADMIN sees every conversation: the messages and the files', adminRowCf.lastInquiryAt && adminThread.messages.length === 3 && adminThread.messages.some((m) => m.file && m.file.kind === 'audio')
       && (await admin('GET', `/api/clients/${cf.id}/chat?channel=alert`)).data.messages.length === 1 && (await admin('GET', '/api/client-alerts/summary')).data.alerts >= 1);
-    check('the others still do not see the chat in lists', (await leaderA2('GET', '/api/clients')).data.find((c) => c.id === cf.id).lastInquiryAt === null);
+    check('the leader sees the same chat in the list', !!(await leaderA2('GET', '/api/clients')).data.find((c) => c.id === cf.id).lastInquiryAt);
     const { DatabaseSync } = require('node:sqlite');
     const peek = new DatabaseSync(path.join(DATA, 'etricks.db'));
     const stored = Number(peek.prepare('SELECT COUNT(*) AS n FROM chat_attachments WHERE client_id=?').get(cf.id).n);

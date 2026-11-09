@@ -66,30 +66,8 @@ function shape(ctx, c) {
   return { ...base, displayName: c.displayName, contact: c.contact, departmentName: c.departmentName, teamName: c.teamName, hasSecret: !!c.secretInfo, lastLoginAt: c.lastLoginAt, createdAt: c.createdAt, staffCount: staffIds(c).length };
 }
 
-// The person who is answering this client's chat (null = nobody yet). An owner who left the client, the department or the
-// company no longer counts, so the chat is never locked behind someone who cannot open it.
-function chatOwner(c) {
-  if (!c.chatOwnerId) return null;
-  const e = db.get("SELECT id, name, role, department_id, status FROM employees WHERE id=?", c.chatOwnerId);
-  if (!e || e.status !== 'active' || e.departmentId !== c.departmentId) return null;
-  if (e.role === 'hod' || staffIds(c).includes(e.id)) return e;
-  return null;
-}
-// Admin: always. Everyone else: only while the chat has no owner, or when they are the owner.
-function canReadChat(ctx, c) {
-  if (ctx.user.role === 'admin') return true;
-  const o = chatOwner(c);
-  return !o || o.id === ctx.user.employeeId;
-}
-function chatGate(ctx, c) {
-  if (!canReadChat(ctx, c)) throw new HttpError(403, 'This conversation is private to the colleague who is answering this client');
-}
-// 'open' (nobody yet), 'mine' or 'colleague'; the admin also learns who.
-function chatInfo(ctx, c) {
-  const o = chatOwner(c);
-  const state = !o ? 'open' : o.id === ctx.user.employeeId ? 'mine' : 'colleague';
-  return ctx.user.role === 'admin' ? { chat: state, chatOwnerId: o?.id ?? null, chatOwnerName: o?.name ?? null } : { chat: state };
-}
+// There is no private owner of a chat: everybody chosen for a client (leader / members), the head of the department and the admin
+// can read and write its chat, and the client can too. Nobody has to "take" it.
 
 // The people chosen for a client who can still work on it (active, same department, same team when the client has one).
 const ASSIGNED_SQL = `SELECT e.id, e.name, e.role, e.team_id, t.name AS team_name FROM client_staff s
@@ -104,17 +82,8 @@ function staffOf(c) {
   return [...new Set([...staffIds(c), ...heads])].map((employeeId) => ({ employeeId })).concat([{ role: 'admin' }]);
 }
 
-// After the people of a client changed: an owner who no longer fits is dropped, so the chat opens up again.
-function tidyOwner(clientId) {
-  const c = db.get(`${CLIENT_SELECT} WHERE c.id=?`, clientId);
-  if (c && c.chatOwnerId && !chatOwner(c)) db.run('UPDATE clients SET chat_owner_id=NULL WHERE id=?', clientId);
-}
-
-// Who is told when the client writes: the owner of the chat and the admin, or (while nobody owns it) everyone who works with the client.
-function chatRecipients(c) {
-  const o = chatOwner(c);
-  return o ? [{ employeeId: o.id }, { role: 'admin' }] : staffOf(c);
-}
+// Who is told when the client writes: everyone who works with the client, the head of the department and the admin.
+const chatRecipients = (c) => staffOf(c);
 
 // Who the admin can pick from: the leader and members of the team (or of the department when the client has no team).
 // One person can work for at most this many clients (each client is a separate sheet of that person).
@@ -148,7 +117,6 @@ function setStaff(c, employeeIds, ctx) {
   const removed = [...before].filter((id) => !wanted.includes(id));
   for (const id of added) notify.send({ employeeId: id }, { title: `You were added to client ${c.username}`, body: 'You can now see its updates and chat.', link: '#/client-updates', kind: 'chat' });
   for (const id of removed) notify.send({ employeeId: id }, { title: `You were removed from client ${c.username}`, body: 'You no longer have access to it.', kind: 'chat' });
-  tidyOwner(c.id);
   if (added.length || removed.length) ctx.audit('client_team_changed', 'client', c.id, `${c.username}: +${added.length} -${removed.length}, now ${wanted.length} people`, c.departmentId);
   return { added: added.length, removed: removed.length, total: wanted.length };
 }
@@ -240,6 +208,8 @@ module.exports = {
        id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL UNIQUE REFERENCES client_messages(id) ON DELETE CASCADE,
        client_id INTEGER NOT NULL, kind TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL, data BLOB NOT NULL, created_at TEXT NOT NULL);
      CREATE INDEX idx_chatatt_client ON chat_attachments(client_id);`,
+    // 7: no private owner of a chat any more: every chat is open to everybody chosen for the client
+    'UPDATE clients SET chat_owner_id=NULL;',
   ],
 
   routes(m) {
@@ -254,13 +224,11 @@ module.exports = {
       const by = {};
       for (const r of reports) (by[r.clientId] ||= []).push(r);
       return rows.map((c) => {
-        const info = chatInfo(ctx, c);
-        const hide = info.chat === 'colleague' && ctx.user.role !== 'admin'; // somebody else answers this client: no chat details
         return {
-          ...shape(ctx, c), ...info,
+          ...shape(ctx, c),
           today: sums((by[c.id] || []).filter((r) => r.date === day)), total: sums(by[c.id] || []),
-          inquiryNeedsReply: !hide && !!last[c.id]?.inquiry?.fromClient, alertNeedsReply: !hide && !!last[c.id]?.alert?.fromClient,
-          lastInquiryAt: hide ? null : last[c.id]?.inquiry?.at ?? null, lastAlertAt: hide ? null : last[c.id]?.alert?.at ?? null,
+          inquiryNeedsReply: !!last[c.id]?.inquiry?.fromClient, alertNeedsReply: !!last[c.id]?.alert?.fromClient,
+          lastInquiryAt: last[c.id]?.inquiry?.at ?? null, lastAlertAt: last[c.id]?.alert?.at ?? null,
         };
       });
     });
@@ -339,7 +307,7 @@ module.exports = {
           ...(b.secretInfo !== undefined ? { secretInfo: str(b.secretInfo, 'Account details', { max: 5000 }) } : {}), updatedAt: new Date().toISOString(),
         });
         if (b.staffIds !== undefined) setStaff({ ...c, username, departmentId, teamId }, b.staffIds, ctx);
-        else if (moved) { db.run('DELETE FROM client_staff WHERE client_id=?', c.id); tidyOwner(c.id); } // another team: the old people no longer fit
+        else if (moved) { db.run('DELETE FROM client_staff WHERE client_id=?', c.id); } // another team: the old people no longer fit
       });
       // a changed ID, department or status signs the client out
       if (status !== 'active' || departmentId !== c.departmentId || username !== c.username) db.run('DELETE FROM sessions WHERE client_id=?', c.id);
@@ -443,7 +411,6 @@ module.exports = {
     // =============================== staff: chat and alerts with a client ===============================
     m.get('/api/clients/:id/chat', { roles: STAFF }, (ctx) => {
       const c = staffClient(ctx, ctx.params.id);
-      chatGate(ctx, c);
       const channel = oneOf(ctx.query.channel, 'Channel', CHANNELS, { required: true });
       const after = Number(ctx.query.after) || 0;
       const rows = db.all('SELECT * FROM client_messages WHERE client_id=? AND channel=? AND id>? ORDER BY id DESC LIMIT 300', c.id, channel, after).reverse();
@@ -451,22 +418,16 @@ module.exports = {
       db.run('UPDATE client_messages SET read_at=? WHERE client_id=? AND channel=? AND from_client=1 AND read_at IS NULL', new Date().toISOString(), c.id, channel);
       const last = db.get('SELECT from_client FROM client_messages WHERE client_id=? AND channel=? ORDER BY id DESC LIMIT 1', c.id, channel);
       const files = filesOf(rows);
-      return { client: { id: c.id, username: c.username }, messages: rows.map((r) => toStaffMessage(r, files)), needsReply: !!last?.fromClient, ...chatInfo(ctx, c) };
+      return { client: { id: c.id, username: c.username }, messages: rows.map((r) => toStaffMessage(r, files)), needsReply: !!last?.fromClient };
     });
 
     m.post('/api/clients/:id/chat', { roles: STAFF, maxBody: attachments.MAX_BODY }, (ctx) => {
       const c = staffClient(ctx, ctx.params.id);
-      chatGate(ctx, c);
       if (c.status !== 'active') throw bad('This client is disabled');
       const channel = oneOf(ctx.body.channel, 'Channel', CHANNELS, { required: true });
       const file = attachments.parse(ctx.body.attachment);
       const body = str(ctx.body.body, 'Message', { required: !file, max: 2000 }) ?? '';
       if (file && db.get('SELECT COUNT(*) AS n FROM chat_attachments WHERE client_id=? AND created_at>=? AND message_id IN (SELECT id FROM client_messages WHERE from_client=0)', c.id, new Date(Date.now() - 3600e3).toISOString()).n >= 60) throw new HttpError(429, 'Too many files in the last hour. Please wait a little.');
-      // the first person to answer becomes the owner of the conversation (the admin only steps in, so does not take it)
-      if (ctx.user.role !== 'admin' && !chatOwner(c)) {
-        db.run('UPDATE clients SET chat_owner_id=? WHERE id=?', ctx.user.employeeId, c.id);
-        ctx.audit('client_chat_taken', 'client', c.id, c.username, c.departmentId);
-      }
       const label = ctx.user.role === 'admin' ? 'Administrator' : db.get('SELECT name, role FROM employees WHERE id=?', ctx.user.employeeId);
       const who = typeof label === 'string' ? label : label.name;
       const now = new Date().toISOString();
@@ -485,35 +446,9 @@ module.exports = {
 
     m.get('/api/clients/:id/chat/files/:fid', { roles: STAFF }, (ctx) => {
       const c = staffClient(ctx, ctx.params.id);
-      chatGate(ctx, c);
       const a = db.get('SELECT * FROM chat_attachments WHERE id=? AND client_id=?', int(ctx.params.fid, 'File', { required: true }), c.id);
       if (!a) throw new HttpError(404, 'File not found');
       return attachments.serve(ctx, a);
-    });
-
-    // The owner (or the admin) gives the conversation back: the chosen people can answer it again.
-    m.post('/api/clients/:id/chat/release', { roles: STAFF }, (ctx) => {
-      const c = staffClient(ctx, ctx.params.id);
-      const o = chatOwner(c);
-      if (!o) return { ok: true };
-      if (ctx.user.role !== 'admin' && o.id !== ctx.user.employeeId) throw new HttpError(403, 'This conversation is private to the colleague who is answering this client');
-      db.run('UPDATE clients SET chat_owner_id=NULL WHERE id=?', c.id);
-      ctx.audit('client_chat_released', 'client', c.id, c.username, c.departmentId);
-      return { ok: true };
-    });
-
-    // Admin: hand the conversation to a chosen person (or to nobody).
-    m.put('/api/clients/:id/chat-owner', { roles: ['admin'] }, (ctx) => {
-      const c = staffClient(ctx, ctx.params.id);
-      const id = ctx.body.employeeId == null || ctx.body.employeeId === '' ? null : int(ctx.body.employeeId, 'Person', { required: true });
-      if (id != null) {
-        const ok = staffIds(c).includes(id) || db.get("SELECT 1 AS x FROM employees WHERE id=? AND role='hod' AND status='active' AND department_id=?", id, c.departmentId);
-        if (!ok) throw bad('That person does not work for this client. Add them under Members first');
-      }
-      db.run('UPDATE clients SET chat_owner_id=? WHERE id=?', id, c.id);
-      ctx.audit(id ? 'client_chat_assigned' : 'client_chat_released', 'client', c.id, c.username, c.departmentId);
-      if (id) notify.send({ employeeId: id }, { title: `You now answer client ${c.username}`, body: 'The conversation is private to you.', link: '#/client-chat', kind: 'chat' });
-      return { ok: true };
     });
 
     // Admin only: wipe a chat (for example after an OTP was shared).
@@ -527,7 +462,7 @@ module.exports = {
 
     // The page polls this every few seconds: how many clients are waiting for an answer, and since when.
     m.get('/api/client-alerts/summary', { roles: STAFF }, (ctx) => {
-      const clients = db.all(`${CLIENT_SELECT} WHERE c.status='active'`).filter((c) => inScope(ctx, c) && canReadChat(ctx, c)); // not the chats a colleague answers
+      const clients = db.all(`${CLIENT_SELECT} WHERE c.status='active'`).filter((c) => inScope(ctx, c));
       if (!clients.length) return { alerts: 0, inquiries: 0, items: [] };
       const last = lastMessages(clients.map((c) => c.id));
       const items = [];
