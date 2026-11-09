@@ -668,21 +668,74 @@ async function main() {
     const ce2 = await W2('POST', '/api/client-reports', { clientId: c1.data.id, date: TODAY, market: 'eBay UK', orders: 3, investment: 50, sales: 120 });
     await W1('POST', '/api/client-reports', { clientId: c1.data.id, date: YESTERDAY, orders: 2, investment: 40, sales: 90, note: 'Quiet day' });
     check('team members add the day\'s work for the client ID', ce1.status === 200 && ce2.status === 200);
-    const csales = (await CL('GET', '/api/portal/sales')).data;
+    const csalesAll = (await CL('GET', '/api/portal/sales')).data;
+    const csales = { ...csalesAll.currencies.find((c) => c.currency === 'USD'), username: csalesAll.username };
+    const usdOf = async (c) => ((await c('GET', '/api/portal/sales')).data.currencies.find((x) => x.currency === 'USD') || { today: { orders: 0 }, total: { orders: 0 } });
     check('TODAY: orders, investment, sales and revenue (sales - investment)', csales.today.orders === 8 && csales.today.investment === 150 && csales.today.sales === 420 && csales.today.revenue === 270, JSON.stringify(csales.today));
     check('DAILY: one row per day with that day\'s updates', csales.days.length === 2 && csales.days[0].date === TODAY && csales.days[0].updates.length === 2 && csales.days[1].sales === 90 && csales.chart.length === 14);
     check('TOTAL: everything so far', csales.total.orders === 10 && csales.total.investment === 190 && csales.total.sales === 510 && csales.total.revenue === 320 && csales.total.since === YESTERDAY);
-    const csalesJson = JSON.stringify(csales);
+    const csalesJson = JSON.stringify(csalesAll);
     check('PRIVATE: the client never sees who wrote the numbers', !/Worker|submitted|by"|staff|employee/i.test(csalesJson) && csales.username === 'ali.traders' && csalesJson.includes('Listed 20 products'));
-    check('the client sees only its own numbers', (await CL2('GET', '/api/portal/sales')).data.total.orders === 0);
+    check('the client sees only its own numbers', (await CL2('GET', '/api/portal/sales')).data.currencies.length === 0);
     const stf = (await W2('GET', `/api/client-reports?clientId=${c1.data.id}&from=${YESTERDAY}&to=${TODAY}`)).data;
-    check('the team sees the entries with who wrote them (internal only)', stf.rows.length === 3 && stf.rows.some((r) => r.by === 'Worker One') && stf.totals.sales === 510);
+    check('the team sees the entries with who wrote them (internal only)', stf.rows.length === 3 && stf.rows.some((r) => r.by === 'Worker One') && stf.totals.sales === 510 && stf.totalsBy.length === 1 && stf.totalsBy[0].currency === 'USD' && stf.rows.every((r) => r.currency === 'USD'));
     check('a member edits only their own update; a leader or the admin any', (await W2('PUT', `/api/client-reports/${ce1.data.id}`, { date: TODAY, orders: 9 })).status === 403 && (await W1('PUT', `/api/client-reports/${ce1.data.id}`, { date: TODAY, market: 'Amazon US', orders: 6, investment: 100, sales: 360, note: 'Corrected' })).status === 200
-      && (await leaderA2('PUT', `/api/client-reports/${ce2.data.id}`, { date: TODAY, orders: 4, investment: 50, sales: 120 })).status === 200 && (await CL('GET', '/api/portal/sales')).data.today.orders === 10);
-    check('delete follows the same rule', (await W1('DELETE', `/api/client-reports/${ce2.data.id}`)).status === 403 && (await leaderA2('DELETE', `/api/client-reports/${ce2.data.id}`)).status === 200 && (await CL('GET', '/api/portal/sales')).data.today.orders === 6);
+      && (await leaderA2('PUT', `/api/client-reports/${ce2.data.id}`, { date: TODAY, orders: 4, investment: 50, sales: 120 })).status === 200 && (await usdOf(CL)).today.orders === 10);
+    check('delete follows the same rule', (await W1('DELETE', `/api/client-reports/${ce2.data.id}`)).status === 403 && (await leaderA2('DELETE', `/api/client-reports/${ce2.data.id}`)).status === 200 && (await usdOf(CL)).today.orders === 6);
     const ce3 = await bm('POST', '/api/client-reports', { clientId: c2.data.id, date: TODAY, orders: 7, sales: 70 });
-    check('a department-wide client gets updates from any team', ce3.status === 200 && (await CL2('GET', '/api/portal/sales')).data.today.orders === 7);
-    check('the client\'s Sales page is the Client Updates, not the sheet: sending a sheet changes nothing there', (await CL('GET', '/api/portal/sales')).data.today.orders === 6 && (await CL('GET', '/api/portal/sales')).data.total.orders === 8);
+    check('a department-wide client gets updates from any team', ce3.status === 200 && (await usdOf(CL2)).today.orders === 7);
+    check('the client\'s Sales page is the Client Updates, not the sheet: sending a sheet changes nothing there', (await usdOf(CL)).today.orders === 6 && (await usdOf(CL)).total.orders === 8);
+
+    console.log('Client currency: the admin chooses it, the client sees everything in it');
+    {
+    const r2 = (x) => Math.round(x * 100) / 100;
+    const fx = (await admin('GET', '/api/settings')).data.fxRates; // what 1 AUD / USD / GBP is worth in the company currency
+    const into = (x, from, to) => (from === to ? x : (x * fx[from]) / fx[to]);
+    const mk = (body) => admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [w1.data.id], password: cpw, ...body });
+    const company = (await admin('GET', '/api/settings')).data.currency;
+    const cDef = await mk({ username: 'cur.default' });
+    const cGbp = await mk({ username: 'cur.gbp', currency: 'GBP' });
+    check('a client is created with a currency; without one it gets the company currency', cDef.status === 200 && cGbp.status === 200 && (await admin('GET', '/api/clients')).data.find((c) => c.id === cDef.data.id).currency === company && (await admin('GET', '/api/clients')).data.find((c) => c.id === cGbp.data.id).currency === 'GBP');
+    check('a currency that does not exist is refused when adding or editing a client', (await mk({ username: 'cur.bad', currency: 'EUR' })).status === 400 && (await mk({ username: 'cur.bad', currency: 'gbp' })).status === 400 && (await admin('PUT', `/api/clients/${cGbp.data.id}`, { currency: 'XYZ' })).status === 400 && (await admin('GET', '/api/clients')).data.every((c) => c.username !== 'cur.bad'));
+    check('the team sees the client\'s currency (it is not private); only the admin can set it', (await W1('GET', '/api/clients')).data.find((c) => c.id === cGbp.data.id).currency === 'GBP' && (await W1('PUT', `/api/clients/${cGbp.data.id}`, { currency: 'AUD' })).status === 403 && (await W1('POST', '/api/clients', { currency: 'AUD' })).status === 403);
+    check('editing a client without a currency keeps it; changing it works', (await admin('PUT', `/api/clients/${cGbp.data.id}`, { displayName: 'Pound client' })).status === 200 && (await admin('GET', '/api/clients')).data.find((c) => c.id === cGbp.data.id).currency === 'GBP'
+      && (await admin('PUT', `/api/clients/${cGbp.data.id}`, { currency: 'AUD' })).status === 200 && (await admin('GET', '/api/clients')).data.find((c) => c.id === cGbp.data.id).currency === 'AUD');
+    await admin('DELETE', `/api/clients/${cDef.data.id}`); await admin('DELETE', `/api/clients/${cGbp.data.id}`);
+
+    const cc = (await mk({ username: 'cur.test', currency: 'AUD' })).data;
+    const CC = client();
+    await CC('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'cur.test', password: cpw });
+    const addCu = (body) => W1('POST', '/api/client-reports', { clientId: cc.id, date: TODAY, ...body });
+    const u1 = await addCu({ orders: 2, investment: 10, sales: 30, currency: 'USD', note: 'dollars today' });
+    const u2 = await addCu({ orders: 3, investment: 100, sales: 300, currency: 'AUD', market: 'eBay AU', note: 'aussie today' });
+    const u3 = await addCu({ orders: 1, investment: 20, sales: 50, currency: 'GBP' });
+    await W1('POST', '/api/client-reports', { clientId: cc.id, date: YESTERDAY, orders: 1, investment: 10, sales: 20, currency: 'AUD', note: 'AUD day' });
+    check('an update can be written in AUD, USD or GBP whatever the client\'s currency is', [u1, u2, u3].every((u) => u.status === 200) && (await addCu({ orders: 1, sales: 5, currency: 'EUR' })).status === 400 && (await addCu({ orders: 1, sales: 5, currency: 'usd' })).status === 400);
+    const u4 = await addCu({ orders: 1, sales: 1 });
+    const staffCc = (await W1('GET', `/api/client-reports?clientId=${cc.id}&from=${YESTERDAY}&to=${TODAY}`)).data;
+    check('an update without a currency starts in the CLIENT\'s currency; every row keeps the currency it was written in', u4.status === 200 && staffCc.rows.find((r) => r.id === u4.data.id).currency === 'AUD' && staffCc.rows.find((r) => r.id === u1.data.id).currency === 'USD' && staffCc.rows.find((r) => r.id === u3.data.id).currency === 'GBP');
+    await W1('DELETE', `/api/client-reports/${u4.data.id}`);
+    const cs3 = (await CC('GET', '/api/portal/sales')).data;
+    const blk = cs3.currencies[0];
+    const todaySales = r2(300) + r2(into(30, 'USD', 'AUD')) + r2(into(50, 'GBP', 'AUD'));
+    const todayInv = r2(100) + r2(into(10, 'USD', 'AUD')) + r2(into(20, 'GBP', 'AUD'));
+    check('the client sees ONE block, in its own currency, and is told that some figures were converted', cs3.currency === 'AUD' && cs3.currencies.length === 1 && blk.currency === 'AUD' && cs3.converted === true);
+    check('TODAY: every figure in AUD (the AUD update as written, USD and GBP converted)', blk.today.orders === 6 && Math.abs(blk.today.sales - todaySales) < 0.011 && Math.abs(blk.today.investment - todayInv) < 0.011 && Math.abs(blk.today.revenue - (todaySales - todayInv)) < 0.011, JSON.stringify(blk.today));
+    check('TOTAL, DAILY, chart and months cover the same figures in AUD', blk.total.orders === 7 && Math.abs(blk.total.sales - (todaySales + 20)) < 0.011 && blk.total.since === YESTERDAY && blk.days.length === 2 && blk.chart.length === 14);
+    check('the notes of every currency are in the one block; no names', JSON.stringify(blk.days).includes('aussie today') && JSON.stringify(blk.days).includes('dollars today') && !/Worker|submitted|staff|employee/i.test(JSON.stringify(cs3)));
+    check('the date range filters the block', (await CC('GET', `/api/portal/sales?from=${TODAY}&to=${TODAY}`)).data.currencies[0].days.length === 1 && (await CC('GET', `/api/portal/sales?from=${TODAY}&to=${TODAY}`)).data.currencies[0].total.orders === 7);
+    const myRow = (await W1('GET', '/api/clients')).data.find((c) => c.id === cc.id);
+    check('the team list shows the client\'s totals in its currency (and as written, per currency)', myRow.currency === 'AUD' && Math.abs(myRow.today.sales - todaySales) < 0.011 && Math.abs(myRow.total.sales - (todaySales + 20)) < 0.011 && myRow.todayBy.map((t) => `${t.currency}:${t.sales}`).sort().join() === 'AUD:300,GBP:50,USD:30' && staffCc.totalsBy.length === 3);
+    check('a client whose updates are all in its own currency is told nothing about conversion', (await usdOf(CL)).today.orders === 6 && (await CL('GET', '/api/portal/sales')).data.converted === false && (await CL('GET', '/api/portal/sales')).data.currency === 'USD');
+    check('changing the client\'s currency shows everything in the new one; nothing is lost', (await admin('PUT', `/api/clients/${cc.id}`, { currency: 'GBP' })).status === 200 && (await CC('GET', '/api/portal/sales')).data.currency === 'GBP'
+      && Math.abs((await CC('GET', '/api/portal/sales')).data.currencies[0].today.sales - (r2(50) + r2(into(30, 'USD', 'GBP')) + r2(into(300, 'AUD', 'GBP')))) < 0.011 && (await CC('GET', '/api/portal/sales')).data.currencies[0].total.orders === 7);
+    check('editing keeps the update\'s currency unless it is changed', (await W1('PUT', `/api/client-reports/${u2.data.id}`, { date: TODAY, orders: 3, investment: 100, sales: 310, market: 'eBay AU' })).status === 200 && (await W1('GET', `/api/client-reports?clientId=${cc.id}&from=${TODAY}&to=${TODAY}`)).data.rows.find((r) => r.id === u2.data.id).currency === 'AUD'
+      && (await W1('PUT', `/api/client-reports/${u3.data.id}`, { date: TODAY, orders: 1, investment: 20, sales: 50, currency: 'USD' })).status === 200 && (await W1('GET', `/api/client-reports?clientId=${cc.id}&from=${TODAY}&to=${TODAY}`)).data.rows.find((r) => r.id === u3.data.id).currency === 'USD'
+      && (await W1('PUT', `/api/client-reports/${u3.data.id}`, { date: TODAY, orders: 1, sales: 50, currency: 'XYZ' })).status === 400);
+    check('another client sees none of it, and deleting an update changes the one block', (await CL2('GET', '/api/portal/sales')).data.currencies.every((c) => c.total.sales !== 310) && (await W1('DELETE', `/api/client-reports/${u1.data.id}`)).status === 200 && (await CC('GET', '/api/portal/sales')).data.currencies[0].total.orders === 5);
+    check('the currencies are in the activity log, never the note', (await admin('GET', '/api/logs?limit=500')).data.some((l) => l.action === 'client_update' && /sales 300 AUD/.test(l.details || '')) && !JSON.stringify((await admin('GET', '/api/logs?limit=500')).data).includes('aussie today'));
+    await admin('DELETE', `/api/clients/${cc.id}`);
+    }
 
     console.log('Client chat (inquiry)');
     const note = async (c, re) => (await c('GET', '/api/notifications?limit=100')).data.items.filter((n) => re.test(n.title));

@@ -25,10 +25,19 @@ function converter() {
   return (amount, currency) => (Number(amount) || 0) * (r[currency] ?? 1);
 }
 
+// A converter into one currency: converterTo('GBP')(amount, 'AUD') -> the amount in GBP (through the company currency rates).
+function converterTo(to) {
+  const r = rates();
+  return (amount, from) => {
+    const n = Number(amount) || 0;
+    return from === to ? n : (n * (r[from] ?? 1)) / (r[to] ?? 1);
+  };
+}
+
 // SQL that converts a column: SUM(o.revenue * <fxSql('o.currency')>). Rates are numbers from code, never user text.
 function fxSql(column = 'currency') {
   const r = rates();
   return `(CASE ${column} WHEN 'AUD' THEN ${Number(r.AUD)} WHEN 'GBP' THEN ${Number(r.GBP)} ELSE ${Number(r.USD)} END)`;
 }
 
-module.exports = { CURRENCIES, DEFAULT_RATES, rates, converter, fxSql };
+module.exports = { CURRENCIES, DEFAULT_RATES, rates, converter, converterTo, fxSql };

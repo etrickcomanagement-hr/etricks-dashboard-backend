@@ -4,6 +4,8 @@ const accounts = require('../../core/accounts');
 const db = require('../../core/db');
 const notify = require('../../core/notify');
 const attachments = require('../../core/attachments');
+const settings = require('../../core/settings');
+const { CURRENCIES, converter, converterTo } = require('../../core/currency');
 const { HttpError, str, int, num, date, oneOf, bad, today, addDays, round } = require('../../core/util');
 
 /*
@@ -17,15 +19,35 @@ const { HttpError, str, int, num, date, oneOf, bad, today, addDays, round } = re
  *   - The admin picks WHICH people work for a client (the team leader and members, chosen one by one). Only those people, the
  *     head of the department and the admin can see that client, its chat and its alerts. Nobody is added just because they are
  *     in the same team. Staff see only the client ID; the real name, contact and secret details are for the admin.
- *   - A chat is private to the person who answers it. While nobody has answered, the chosen people (and the head) can read and
- *     answer it; the first reply makes that person the owner, and from then on only the owner and the admin can read the
- *     conversation or get its notifications. The owner or the admin can release it; the admin can hand it to someone else.
+ *   - A chat is shared: everybody chosen for the client, the head of the department and the admin can read and write it.
+ *   - Every client has a currency (AUD, USD or GBP) chosen by the admin: the client sees all its figures in it. An update has a
+ *     currency too (it starts as the client's); one written in another currency is converted with the exchange rates in Settings.
  */
 const STAFF = ['admin', 'hod', 'leader', 'member'];
 const CHANNELS = ['inquiry', 'alert'];
 const USERNAME = /^[A-Za-z0-9][A-Za-z0-9._-]{2,29}$/;
 
 const revenueOf = (r) => round((r.sales || 0) - (r.investment || 0));
+// The currency of an update that does not say one: the company currency when it is one of ours, else USD.
+const defaultCurrency = () => { const c = settings.get('currency'); return CURRENCIES.includes(c) ? c : 'USD'; };
+// Totals per currency: [{ currency, orders, investment, sales, revenue }], the biggest sales first.
+const sumsBy = (rows) => {
+  const by = {};
+  for (const r of rows) (by[r.currency || 'USD'] ||= []).push(r);
+  return Object.entries(by).map(([currency, list]) => ({ currency, ...sums(list) })).sort((a, b) => b.sales - a.sales || a.currency.localeCompare(b.currency));
+};
+// Totals of the rows in ONE currency: every row is converted into it first (rows already in it stay exactly as written).
+const sumsIn = (rows, to) => {
+  const conv = converterTo(to);
+  return sums(rows.map((r) => ({ ...r, investment: conv(r.investment, r.currency), sales: conv(r.sales, r.currency) })));
+};
+// All currencies converted into the company currency with the admin's exchange rates (for totals over several clients).
+const sumsConverted = (rows) => {
+  const conv = converter();
+  const t = { orders: 0, investment: 0, sales: 0 };
+  for (const r of rows) { t.orders += r.orders; t.investment += conv(r.investment, r.currency); t.sales += conv(r.sales, r.currency); }
+  return { orders: t.orders, investment: round(t.investment), sales: round(t.sales), revenue: round(t.sales - t.investment) };
+};
 const sums = (rows) => {
   const t = { orders: 0, investment: 0, sales: 0 };
   for (const r of rows) { t.orders += r.orders; t.investment += r.investment; t.sales += r.sales; }
@@ -61,7 +83,7 @@ const CLIENT_SELECT = `
 
 // The staff view of a client: the ID only. The admin also gets the private details (but never the secret text here).
 function shape(ctx, c) {
-  const base = { id: c.id, username: c.username, departmentId: c.departmentId, teamId: c.teamId, status: c.status };
+  const base = { id: c.id, username: c.username, departmentId: c.departmentId, teamId: c.teamId, status: c.status, currency: c.currency };
   if (ctx.user.role !== 'admin') return base;
   return { ...base, displayName: c.displayName, contact: c.contact, departmentName: c.departmentName, teamName: c.teamName, hasSecret: !!c.secretInfo, lastLoginAt: c.lastLoginAt, createdAt: c.createdAt, staffCount: staffIds(c).length };
 }
@@ -210,6 +232,20 @@ module.exports = {
      CREATE INDEX idx_chatatt_client ON chat_attachments(client_id);`,
     // 7: no private owner of a chat any more: every chat is open to everybody chosen for the client
     'UPDATE clients SET chat_owner_id=NULL;',
+    // 8: every client update has a currency. What was written before keeps the company currency when that is AUD, USD or GBP (else USD).
+    (d) => {
+      d.raw.exec("ALTER TABLE client_reports ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'");
+      let cur = 'USD';
+      try { cur = JSON.parse(d.get("SELECT value FROM settings WHERE key='currency'")?.value ?? '"USD"'); } catch { /* keep USD */ }
+      if (['AUD', 'USD', 'GBP'].includes(cur) && cur !== 'USD') d.run('UPDATE client_reports SET currency=?', cur);
+    },
+    // 9: every client has a currency: the one its figures are shown in. Existing clients keep what they had (the company currency).
+    (d) => {
+      d.raw.exec("ALTER TABLE clients ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'");
+      let cur = 'USD';
+      try { cur = JSON.parse(d.get("SELECT value FROM settings WHERE key='currency'")?.value ?? '"USD"'); } catch { /* keep USD */ }
+      if (['AUD', 'USD', 'GBP'].includes(cur) && cur !== 'USD') d.run('UPDATE clients SET currency=?', cur);
+    },
   ],
 
   routes(m) {
@@ -220,13 +256,14 @@ module.exports = {
       const ids = rows.map((c) => c.id);
       const last = lastMessages(ids);
       const day = today();
-      const reports = ids.length ? db.all(`SELECT client_id, date, orders, investment, sales FROM client_reports WHERE client_id IN (${ids.map(() => '?').join(',')})`, ...ids) : [];
+      const reports = ids.length ? db.all(`SELECT client_id, date, orders, investment, sales, currency FROM client_reports WHERE client_id IN (${ids.map(() => '?').join(',')})`, ...ids) : [];
       const by = {};
       for (const r of reports) (by[r.clientId] ||= []).push(r);
       return rows.map((c) => {
         return {
           ...shape(ctx, c),
-          today: sums((by[c.id] || []).filter((r) => r.date === day)), total: sums(by[c.id] || []),
+          today: sumsIn((by[c.id] || []).filter((r) => r.date === day), c.currency), total: sumsIn(by[c.id] || [], c.currency), // in the client's currency
+          todayBy: sumsBy((by[c.id] || []).filter((r) => r.date === day)), totalBy: sumsBy(by[c.id] || []), // as written, each currency on its own
           inquiryNeedsReply: !!last[c.id]?.inquiry?.fromClient, alertNeedsReply: !!last[c.id]?.alert?.fromClient,
           lastInquiryAt: last[c.id]?.inquiry?.at ?? null, lastAlertAt: last[c.id]?.alert?.at ?? null,
         };
@@ -259,6 +296,7 @@ module.exports = {
         const row = db.insert('clients', {
           username, departmentId, teamId, displayName: str(b.displayName, 'Name', { max: 100 }), contact: str(b.contact, 'Contact', { max: 200 }),
           secretInfo: str(b.secretInfo, 'Account details', { max: 5000 }), passwordHash: auth.hashSecret(password), status: 'active', createdAt: now, updatedAt: now,
+          currency: oneOf(b.currency === undefined || b.currency === null || b.currency === '' ? defaultCurrency() : b.currency, 'Currency', CURRENCIES, { required: true }),
         });
         setStaff({ id: row.id, username, departmentId, teamId }, wanted, ctx);
         return row;
@@ -304,6 +342,7 @@ module.exports = {
       db.tx(() => {
         db.update('clients', c.id, {
           username, departmentId, teamId, status, displayName: str(b.displayName, 'Name', { max: 100 }), contact: str(b.contact, 'Contact', { max: 200 }),
+          currency: b.currency === undefined || b.currency === null || b.currency === '' ? c.currency : oneOf(b.currency, 'Currency', CURRENCIES, { required: true }),
           ...(b.secretInfo !== undefined ? { secretInfo: str(b.secretInfo, 'Account details', { max: 5000 }) } : {}), updatedAt: new Date().toISOString(),
         });
         if (b.staffIds !== undefined) setStaff({ ...c, username, departmentId, teamId }, b.staffIds, ctx);
@@ -345,13 +384,14 @@ module.exports = {
 
     // =============================== staff: the daily numbers for a client ===============================
     const REPORT_SELECT = 'SELECT r.*, c.username FROM client_reports r JOIN clients c ON c.id=r.client_id';
-    const reportInput = (b) => {
+    const reportInput = (b, fallbackCurrency = null) => {
       const day = date(b.date, 'Date', { required: true });
       if (day > today()) throw bad('Date cannot be in the future');
       const e = {
         date: day, market: str(b.market, 'Market', { max: 100 }), store: str(b.store, 'Store / account', { max: 100 }),
         orders: int(b.orders ?? 0, 'Orders', { min: 0, max: 1e7 }), investment: num(b.investment ?? 0, 'Investment', { min: 0, max: 1e9 }), sales: num(b.sales ?? 0, 'Sales', { min: 0, max: 1e9 }),
         note: str(b.note, 'Update for the client', { max: 1000 }),
+        currency: oneOf(b.currency === undefined || b.currency === null || b.currency === '' ? (fallbackCurrency || defaultCurrency()) : b.currency, 'Currency', CURRENCIES, { required: true }),
       };
       if (!e.orders && !e.investment && !e.sales && !e.note) throw bad('Enter at least orders, investment, sales or an update');
       return e;
@@ -369,21 +409,21 @@ module.exports = {
       const to = q.to ? date(q.to, 'To') : today();
       const clients = Object.fromEntries(db.all(`${CLIENT_SELECT}`).filter((c) => inScope(ctx, c) && (!q.clientId || c.id === Number(q.clientId))).map((c) => [c.id, c]));
       const ids = Object.keys(clients).map(Number);
-      if (!ids.length) return { rows: [], totals: sums([]) };
+      if (!ids.length) return { rows: [], totals: sumsConverted([]), totalsBy: [] };
       const rows = db.all(`${REPORT_SELECT} WHERE r.client_id IN (${ids.map(() => '?').join(',')}) AND r.date BETWEEN ? AND ? ORDER BY r.date DESC, r.id DESC LIMIT 1000`, ...ids, from, to)
         .map((r) => ({ ...r, revenue: revenueOf(r), canEdit: canEditReport(ctx, r, clients[r.clientId]), by: r.submittedLabel || 'Team' }));
-      return { rows, totals: sums(rows) };
+      return { rows, totals: sumsConverted(rows), totalsBy: sumsBy(rows) };
     });
 
     m.post('/api/client-reports', { roles: STAFF }, (ctx) => {
       const c = staffClient(ctx, ctx.body.clientId);
       if (c.status !== 'active') throw bad('This client is disabled');
-      const e = reportInput(ctx.body);
+      const e = reportInput(ctx.body, c.currency);
       if (ctx.user.role === 'member' && e.date < addDays(today(), -31)) throw bad('You can only add updates from the last 31 days');
       const now = new Date().toISOString();
       const label = ctx.user.role === 'admin' ? 'Administrator' : db.get('SELECT name FROM employees WHERE id=?', ctx.user.employeeId)?.name;
       const r = db.insert('client_reports', { clientId: c.id, ...e, submittedBy: ctx.user.employeeId ?? null, submittedLabel: label, createdAt: now, updatedAt: now });
-      ctx.audit('client_update', 'client', c.id, `${c.username} ${e.date}: ${e.orders} orders, sales ${e.sales}`, c.departmentId);
+      ctx.audit('client_update', 'client', c.id, `${c.username} ${e.date}: ${e.orders} orders, sales ${e.sales} ${e.currency}`, c.departmentId);
       return { id: r.id };
     });
 
@@ -392,7 +432,7 @@ module.exports = {
       if (!r) throw new HttpError(404, 'Update not found');
       const c = staffClient(ctx, r.clientId);
       if (!canEditReport(ctx, r, c)) throw new HttpError(403, 'You can only change your own updates for 7 days');
-      const e = reportInput(ctx.body);
+      const e = reportInput(ctx.body, r.currency);
       db.update('client_reports', r.id, { ...e, updatedAt: new Date().toISOString() });
       ctx.audit('client_update_edited', 'client', c.id, `${c.username} ${e.date}`, c.departmentId);
       return { ok: true };
@@ -483,31 +523,40 @@ module.exports = {
     const CLIENT = ['client'];
     const me = (ctx) => db.get(`${CLIENT_SELECT} WHERE c.id=?`, ctx.user.clientId);
 
+    // Sales of the client: today, every day, every month and the total, all in the currency the admin chose for this client.
+    // An update written in another currency is converted into it with the exchange rates of Settings (`converted` says so).
     m.get('/api/portal/sales', { roles: CLIENT }, (ctx) => {
       const c = me(ctx);
       const day = today();
       const from = ctx.query.from ? date(ctx.query.from, 'From') : addDays(day, -29);
       const to = ctx.query.to ? date(ctx.query.to, 'To') : day;
       if (from > to) throw bad('"To" cannot be before "From"');
-      const all = db.all('SELECT date, market, store, orders, investment, sales, note FROM client_reports WHERE client_id=? ORDER BY date', c.id);
+      const conv = converterTo(c.currency);
+      let converted = false;
+      const all = db.all('SELECT date, market, store, orders, investment, sales, note, currency FROM client_reports WHERE client_id=? ORDER BY date, id', c.id).map((r) => {
+        if (r.currency === c.currency) return r;
+        converted = true;
+        return { ...r, investment: round(conv(r.investment, r.currency)), sales: round(conv(r.sales, r.currency)) };
+      });
+      const monthStart = `${day.slice(0, 8)}01`;
       const inRange = all.filter((r) => r.date >= from && r.date <= to);
       const byDay = new Map();
       for (const r of inRange) { if (!byDay.has(r.date)) byDay.set(r.date, []); byDay.get(r.date).push(r); }
-      const days = [...byDay.entries()].sort((a, b) => b[0].localeCompare(a[0])).map(([d, rs]) => ({
+      const days = [...byDay.entries()].sort((x, y) => y[0].localeCompare(x[0])).map(([d, rs]) => ({
         date: d, ...sums(rs),
         // what was done that day, as written for the client: always "eTricks"
         updates: rs.map((r) => ({ market: r.market, store: r.store, orders: r.orders, investment: r.investment, sales: r.sales, revenue: revenueOf(r), note: r.note })),
       }));
-      const monthStart = `${day.slice(0, 8)}01`;
       const chart = [];
       for (let i = 13; i >= 0; i--) { const d = addDays(day, -i); chart.push({ date: d, ...sums(all.filter((r) => r.date === d)) }); }
-      return {
-        username: c.username, departmentName: c.departmentName, from, to,
+      const block = {
+        currency: c.currency,
         today: { date: day, ...sums(all.filter((r) => r.date === day)) },
         month: sums(all.filter((r) => r.date >= monthStart)),
         total: { ...sums(all), since: all[0]?.date ?? null, days: new Set(all.map((r) => r.date)).size },
         range: sums(inRange), days, chart,
       };
+      return { username: c.username, departmentName: c.departmentName, currency: c.currency, from, to, date: day, converted, currencies: all.length ? [block] : [] };
     });
 
     m.get('/api/portal/summary', { roles: CLIENT }, (ctx) => {
