@@ -87,7 +87,13 @@ async function main() {
     const tC = (await hod('POST', '/api/teams', { name: 'Gamma' })).data.id;
     const tZ = (await hod2('POST', '/api/teams', { name: 'Zeta' })).data.id;
     check('four teams created', [tA, tB, tC, tZ].every(Number.isInteger));
-    check('a department cannot have more than 3 teams (3 team leaders)', (await hod('POST', '/api/teams', { name: 'Delta' })).status === 400 && (await admin('POST', '/api/teams', { departmentId: ebayId, name: 'Delta' })).status === 400 && (await hod('GET', '/api/teams')).data.length === 3);
+    check('a department can have up to 10 teams (10 team leaders), not more', (await hod('POST', '/api/teams', { name: 'Delta' })).status === 200 && (await hod('GET', '/api/teams')).data.length === 4);
+    await hod('DELETE', `/api/teams/${(await hod('GET', '/api/teams')).data.find((t) => t.name === 'Delta').id}`);
+    const extraTeams = [];
+    for (let n = 1; n <= 9; n++) extraTeams.push((await hod2('POST', '/api/teams', { name: `Extra ${n}` })).data.id); // Zeta + 9 = 10
+    check('ten teams are accepted; the eleventh is refused (by the head and by the admin), with a clear message', extraTeams.every(Number.isInteger) && (await hod2('GET', '/api/teams')).data.length === 10 && (await hod2('POST', '/api/teams', { name: 'Eleventh' })).status === 400 && /only 10 teams/.test((await hod2('POST', '/api/teams', { name: 'Eleventh' })).data.error) && (await admin('POST', '/api/teams', { departmentId: amazonId, name: 'Eleventh' })).status === 400);
+    for (const id of extraTeams) await hod2('DELETE', `/api/teams/${id}`);
+    check('after removing them the department is back to one team and can add again', (await hod2('GET', '/api/teams')).data.length === 1);
     check('duplicate team name refused', (await hod('POST', '/api/teams', { name: 'Alpha' })).status === 400);
     check('head sees only their own department teams', (await hod('GET', '/api/teams')).data.length === 3 && (await hod2('GET', '/api/teams')).data.length === 1);
     check('leader needs a password', (await hod('POST', `/api/teams/${tA}/leader`, { name: 'No Pass' })).status === 400);
@@ -651,7 +657,7 @@ async function main() {
     check('only the chosen members send a sheet to the client', (await publishTo(bm, c1.data.id)).status === 400 && (await publishTo(hodNew, c1.data.id)).status === 403 && (await publishTo(W1, c1.data.id)).status === 200 && (await publishTo(W2, c1.data.id)).status === 200);
     const sheetJson = JSON.stringify((await CL('GET', '/api/portal/sheet')).data);
     check('PRIVATE: the client sees the sheets (notes too) but never who wrote them, nor the team-only Market / Store', !/Worker|employee|"market"|"store"|Amazon US|eBay UK|submitted/i.test(sheetJson) && sheetJson.includes('Listed 20 products') && sheetJson.includes('John, Sydney')
-      && (await CL('GET', '/api/portal/sheet')).data.sheets.map((x) => x.title).join() === 'Sheet 1,Sheet 2');
+      && (await CL('GET', '/api/portal/sheet')).data.sheets.map((x) => x.title).join() === 'Account 1,Account 2');
     check('another client sees none of these sheets', (await CL2('GET', '/api/portal/sheet')).data.sheets.length === 0);
     const stampA = (await CL('GET', '/api/portal/sheet/stamp')).data.stamp;
     check('a member edits only their own row; the client sees the change only after the next update', (await W2('PUT', `/api/orders/${e1.data.id}`, { orders: 9 })).status === 404 && (await W1('PUT', `/api/orders/${e1.data.id}`, { orders: 6, investment: 100, revenue: 360, note: 'Corrected' })).status === 200
@@ -916,7 +922,7 @@ async function main() {
     check('Update client sends a copy of that sheet and says it is up to date', pub1.status === 200 && pub1.data.rows === 3 && pub1.data.upToDate === true && (await sheetOf1()).published.find((p) => p.clientId === cs.data.id).upToDate === true);
     const v1 = await csheet(); const sh = v1.sheets[0];
     const first = sh.rows.find((r) => r.orderId === 'ORD-1001');
-    check('the client sees the whole sheet: the permanent columns (comments, notes too) and only the own columns marked for it, never Market / Store', v1.sheets.length === 1 && sh.title === 'Sheet' && sh.rows.length === 3 && sh.columns.map((c) => c.label).join() === 'Product'
+    check('the client sees the whole sheet: the permanent columns (comments, notes too) and only the own columns marked for it, never Market / Store', v1.sheets.length === 1 && sh.title === 'Account 1' && sh.account === 1 && sh.rows.length === 3 && sh.columns.map((c) => c.label).join() === 'Product'
       && first.customer === 'John Smith, Sydney' && first.supplierOrderNo === 'AE-778' && first.comments === 'Fast shipping' && first.roi === 150 && first.profit === 60 && first.extra[prod.data.id] === 'Mug' && first.extra[refund.data.id] === undefined
       && sh.rows.some((r) => /internal remark/.test(r.note)) && !/market|store/i.test(Object.keys(first).join()) && sh.totals.USD.revenue === 100 && sh.totals.AUD.revenue === 200 && sh.totals.GBP.revenue === 100 && v1.username === 'sheet.test' && !!sh.publishedAt);
     check('the other client\'s sheet is not mixed in', !JSON.stringify(v1).includes('T-1') && !JSON.stringify(v1).includes('wrong sheet'));
@@ -1043,6 +1049,54 @@ async function main() {
     check('deleting the client deletes every file of it', (await admin('DELETE', `/api/clients/${cf.id}`)).status === 200 && Number(peek2.prepare('SELECT COUNT(*) AS n FROM chat_attachments WHERE client_id=?').get(cf.id).n) === 0);
     peek2.close();
 
+    }
+
+    console.log('One client portal, one section ("Account 1", "Account 2" ...) for every person who works for the client');
+    {
+      const tmp = (await leaderA2('POST', '/api/employees', { name: 'Acct Temp', joinDate: YESTERDAY })).data;
+      const T = await mlogin(tmp);
+      const ca = (await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [sh1.id, sh2.id, tmp.id], username: 'acct.test', password: cpw })).data;
+      const cb = (await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [sh2.id], username: 'acct.other', password: cpw })).data;
+      const CA = client(); await CA('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'acct.test', password: cpw });
+      const CB = client(); await CB('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'acct.other', password: cpw });
+      const upd = (c, id, o) => c('POST', '/api/client-reports', { clientId: id, date: TODAY, ...o });
+      check('before anybody writes, the client has no sections and the admin sees no numbers', (await CA('GET', '/api/portal/sales')).data.accounts.length === 0 && (await CA('GET', '/api/portal/sheet')).data.sheets.length === 0
+        && (await admin('GET', `/api/clients/${ca.id}/staff`)).data.candidates.every((e) => e.accountNo === null));
+      await upd(S2, ca.id, { orders: 5, investment: 50, sales: 200, note: 'second person first' });
+      await upd(S1, ca.id, { orders: 1, investment: 10, sales: 30, note: 'first person second' });
+      await upd(S2, ca.id, { orders: 2, investment: 20, sales: 40 });
+      await upd(T, ca.id, { orders: 7, investment: 70, sales: 100, note: 'third person' });
+      await upd(S2, cb.id, { orders: 9, investment: 90, sales: 900 });
+      const all = (await CA('GET', '/api/portal/sales')).data;
+      check('every person gets a fixed number in the order they first wrote: 1, 2, 3 without gaps, the same every time', all.accounts.map((a) => `${a.no}:${a.label}`).join() === '1:Account 1,2:Account 2,3:Account 3');
+      check('"All accounts" is everybody together', all.account === 'all' && all.currencies[0].total.orders === 15 && all.currencies[0].total.sales === 370);
+      const a1 = (await CA('GET', '/api/portal/sales?account=1')).data, a2 = (await CA('GET', '/api/portal/sales?account=2')).data, a3 = (await CA('GET', '/api/portal/sales?account=3')).data;
+      check('each account is a section of its own: its own numbers and its own notes, nothing of the others', a1.account === 1 && a1.currencies[0].total.orders === 7 && a1.currencies[0].total.sales === 240 && JSON.stringify(a1).includes('second person first') && !JSON.stringify(a1).includes('third person') && !JSON.stringify(a1).includes('first person second')
+        && a2.account === 2 && a2.currencies[0].total.orders === 1 && a2.currencies[0].total.sales === 30 && JSON.stringify(a2).includes('first person second') && a3.currencies[0].total.orders === 7 && a3.currencies[0].today.sales === 100);
+      check('the three sections add up to the whole', a1.currencies[0].total.sales + a2.currencies[0].total.sales + a3.currencies[0].total.sales === all.currencies[0].total.sales && a1.accounts.length === 3);
+      check('a section that does not exist is refused; so is nonsense', (await CA('GET', '/api/portal/sales?account=9')).status === 404 && (await CA('GET', '/api/portal/sales?account=abc')).status === 400 && (await CA('GET', '/api/portal/sales?account=0')).status === 404);
+      check('PRIVATE: the client never learns who is behind an account', !/Sheet One|Sheet Two|Acct Temp|employee|submitted/i.test(JSON.stringify([all, a1, a2, a3])));
+      check('numbers are per client: the same person is Account 1 of another client, whose portal knows nothing of the first', (await CB('GET', '/api/portal/sales')).data.accounts.map((a) => a.label).join() === 'Account 1' && (await CB('GET', '/api/portal/sales')).data.currencies[0].total.sales === 900);
+      check('the admin sees which account each person is (the team does not need it)', (await admin('GET', `/api/clients/${ca.id}/staff`)).data.candidates.filter((e) => e.chosen).map((e) => `${e.name}:${e.accountNo}`).sort().join() === 'Acct Temp:3,Sheet One:2,Sheet Two:1');
+      // the Daily Sheet: the same numbers, one tab each
+      const myRows = [];
+      for (const [c, who] of [[S1, 'one'], [S2, 'two'], [T, 'three']]) {
+        myRows.push([c, (await c('POST', '/api/orders', { clientId: ca.id, date: TODAY, orders: 1, investment: 5, revenue: 15, orderId: `ACC-${who}` })).data.id]);
+        await c('POST', '/api/orders/publish', { clientId: ca.id });
+      }
+      const sheets = (await CA('GET', '/api/portal/sheet')).data.sheets;
+      check('the Daily Sheet has the same sections: "Account 1" is the person who wrote first, whoever sent a sheet first', sheets.map((x) => `${x.account}:${x.title}`).join() === '1:Account 1,2:Account 2,3:Account 3'
+        && sheets[0].rows[0].orderId === 'ACC-two' && sheets[1].rows[0].orderId === 'ACC-one' && sheets[2].rows[0].orderId === 'ACC-three');
+      check('sending a sheet again keeps the same account; the member is told which one they are', (await S2('POST', '/api/orders/publish', { clientId: ca.id })).data.account === 1 && (await CA('GET', '/api/portal/sheet')).data.sheets.map((x) => x.account).join() === '1,2,3'
+        && (await S1('GET', `/api/orders/me?${RANGE}&client=${ca.id}`)).data.published.find((p) => p.clientId === ca.id).account === 2);
+      check('an account that withdraws its sheet disappears from the Daily Sheet (its updates stay in Sales)', (await T('DELETE', `/api/orders/publish/${ca.id}`)).status === 200 && (await CA('GET', '/api/portal/sheet')).data.sheets.map((x) => x.account).join() === '1,2');
+      check('the chat stays one chat for the whole portal (not per account)', (await CA('POST', '/api/portal/chat', { channel: 'inquiry', body: 'one chat' })).status === 200 && (await S1('GET', `/api/clients/${ca.id}/chat?channel=inquiry`)).data.messages.length === 1 && (await S2('GET', `/api/clients/${ca.id}/chat?channel=inquiry`)).data.messages.length === 1);
+      // a person who leaves: what they wrote stays, in their section, with the same number
+      check('when a person is deleted their section stays for the client, with the same number', (await leaderA2('DELETE', `/api/employees/${tmp.id}`)).status === 200 && (await CA('GET', '/api/portal/sales?account=3')).data.currencies[0].total.orders === 7
+        && (await CA('GET', '/api/portal/sales')).data.accounts.length === 3 && (await CA('GET', '/api/portal/sales')).data.currencies[0].total.orders === 15);
+      check('a new person is numbered after the existing ones, never reusing a number', (await upd(admin, ca.id, { orders: 1, sales: 1 })).status === 200 && (await CA('GET', '/api/portal/sales')).data.accounts.map((a) => a.no).join() === '1,2,3,4');
+      for (const [c, id] of myRows) await c('DELETE', `/api/orders/${id}`); // the members' own sheets are as they were
+      await admin('DELETE', `/api/clients/${ca.id}`); await admin('DELETE', `/api/clients/${cb.id}`);
     }
 
     check('removing a client keeps the member\'s rows (they move to the general sheet) and removes the copy', (await admin('DELETE', `/api/clients/${cs2.data.id}`)).status === 200 && (await S1('GET', `/api/orders/me?${RANGE}&client=general`)).data.rows.length === 1 && (await S1('GET', `/api/orders/me?${RANGE}&client=general`)).data.hasGeneral === true);
@@ -1190,7 +1244,7 @@ async function main() {
     check('an unknown backup number is 404', (await admin('GET', '/api/backups/full/99999/download')).status === 404 && (await admin('DELETE', '/api/backups/full/99999')).status === 404);
     const got = await admin('GET', `/api/backups/full/${fbId}/download`);
     check('the download is the whole file (the size announced)', got.status === 200 && /attachment/.test(got.headers.get('content-disposition')) && Number(got.headers.get('content-length')) === fbNew.data.size);
-    await new Promise((r) => setTimeout(r, 400));
+    for (let n = 0; n < 30 && (await admin('GET', '/api/backups/full')).data.items.find((x) => x.id === fbId).status !== 'downloaded'; n++) await new Promise((r) => setTimeout(r, 100)); // the server marks it once the whole file has gone
     const fbAfter = (await admin('GET', '/api/backups/full')).data.items.find((x) => x.id === fbId);
     check('once downloaded it is marked as downloaded and no longer expires', fbAfter.status === 'downloaded' && fbAfter.expiresAt === null && !!fbAfter.downloadedAt && fbAfter.downloadedBy);
     check('the warning goes away when everything waiting has been downloaded', (await admin('GET', '/api/backups/summary')).data.alert === null);

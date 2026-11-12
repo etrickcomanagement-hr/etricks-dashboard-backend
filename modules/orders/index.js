@@ -3,6 +3,7 @@ const crypto = require('node:crypto');
 const db = require('../../core/db');
 const notify = require('../../core/notify');
 const { loadEmployee } = require('../../core/scope');
+const clientAccounts = require('../../core/clientaccounts');
 const { converter, rates, CURRENCIES } = require('../../core/currency');
 const { HttpError, int, str, num, date, oneOf, range, today, addDays, bad, round, parseJson } = require('../../core/util');
 
@@ -99,6 +100,8 @@ module.exports = {
      DROP TABLE sheet_publications;
      ALTER TABLE sheet_publications_new RENAME TO sheet_publications;
      CREATE INDEX idx_pub_client ON sheet_publications(client_id);`,
+    // 7: which section ("Account 1", "Account 2" ...) of the client's portal a copy belongs to; the clients module fills it in
+    'ALTER TABLE sheet_publications ADD COLUMN account_no INTEGER;',
   ],
 
   routes(m) {
@@ -184,8 +187,8 @@ module.exports = {
     };
     // The copies this person has sent, and whether each is still the same as the sheet now.
     const publicationsOf = (employeeId) => db.all(
-      `SELECT p.client_id, p.hash, p.row_count, p.published_at, c.username FROM sheet_publications p JOIN clients c ON c.id=p.client_id WHERE p.employee_id=? ORDER BY p.id`, employeeId)
-      .map((p) => ({ clientId: p.clientId, username: p.username, publishedAt: p.publishedAt, rows: p.rowCount, upToDate: snapshotFor(employeeId, p.clientId).hash === p.hash }));
+      `SELECT p.client_id, p.hash, p.row_count, p.published_at, p.account_no, c.username FROM sheet_publications p JOIN clients c ON c.id=p.client_id WHERE p.employee_id=? ORDER BY p.id`, employeeId)
+      .map((p) => ({ clientId: p.clientId, username: p.username, account: p.accountNo, publishedAt: p.publishedAt, rows: p.rowCount, upToDate: snapshotFor(employeeId, p.clientId).hash === p.hash }));
 
     const csvColumns = [
       { label: 'SR#', key: 'sr' }, { label: 'Date', key: 'date' }, { label: 'Order Id', key: 'orderId' }, { label: 'Customer Details', key: 'customer' }, { label: 'Qty', key: 'orders' },
@@ -232,13 +235,14 @@ module.exports = {
       if (!data.rows.length) throw bad('Nothing to send: this sheet has no rows yet');
       const now = new Date().toISOString();
       const dates = data.rows.map((r) => r.date);
+      const account = clientAccounts.ensure(clientId, ctx.user.employeeId); // "Account N" of this client's portal: the same one every time
       db.run(
-        `INSERT INTO sheet_publications(client_id, employee_id, from_date, to_date, data, hash, row_count, published_at) VALUES (?,?,?,?,?,?,?,?)
-         ON CONFLICT(client_id, employee_id) DO UPDATE SET from_date=excluded.from_date, to_date=excluded.to_date, data=excluded.data, hash=excluded.hash, row_count=excluded.row_count, published_at=excluded.published_at`,
-        clientId, ctx.user.employeeId, dates.reduce((a, b) => (a < b ? a : b)), dates.reduce((a, b) => (a > b ? a : b)), JSON.stringify(data), hash, data.rows.length, now);
+        `INSERT INTO sheet_publications(client_id, employee_id, from_date, to_date, data, hash, row_count, published_at, account_no) VALUES (?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(client_id, employee_id) DO UPDATE SET from_date=excluded.from_date, to_date=excluded.to_date, data=excluded.data, hash=excluded.hash, row_count=excluded.row_count, published_at=excluded.published_at, account_no=COALESCE(sheet_publications.account_no, excluded.account_no)`,
+        clientId, ctx.user.employeeId, dates.reduce((a, b) => (a < b ? a : b)), dates.reduce((a, b) => (a > b ? a : b)), JSON.stringify(data), hash, data.rows.length, now, account);
       ctx.audit('sheet_published', 'orders', clientId, `${client.username}: ${data.rows.length} rows`); // never the figures
       notify.send({ clientId }, { title: 'Your sheet was updated', body: 'Open the Daily Sheet page of your portal.', link: '#/portal-sheet', kind: 'sheet' });
-      return { clientId, username: client.username, publishedAt: now, rows: data.rows.length, upToDate: true };
+      return { clientId, username: client.username, account, publishedAt: now, rows: data.rows.length, upToDate: true };
     });
 
     // Stop showing the sheet to a client.
@@ -377,12 +381,13 @@ module.exports = {
     });
 
     // ---- the client's view: the copies of the sheet the team sent, exactly as sent ----
-    // One sheet per member who updated this client; the client never learns who ("Sheet 1", "Sheet 2" only when there are several).
+    // One section per person who updated this client: "Account 1", "Account 2" ... The same number every time, never a name.
     m.get('/api/portal/sheet', { roles: ['client'] }, (ctx) => {
-      const pubs = db.all('SELECT id, from_date, to_date, data, published_at FROM sheet_publications WHERE client_id=? ORDER BY id', ctx.user.clientId);
+      const pubs = db.all('SELECT id, from_date, to_date, data, published_at, account_no FROM sheet_publications WHERE client_id=? ORDER BY COALESCE(account_no, 1e9), id', ctx.user.clientId);
       const sheets = pubs.map((p, i) => {
         const d = parseJson(p.data, { columns: [], rows: [] });
-        return { title: pubs.length > 1 ? `Sheet ${i + 1}` : 'Sheet', publishedAt: p.publishedAt, from: p.fromDate, to: p.toDate, columns: d.columns, rows: d.rows, totals: totals(d.rows).byCurrency };
+        const account = p.accountNo ?? i + 1;
+        return { account, title: `Account ${account}`, publishedAt: p.publishedAt, from: p.fromDate, to: p.toDate, columns: d.columns, rows: d.rows, totals: totals(d.rows).byCurrency };
       });
       return { username: db.get('SELECT username FROM clients WHERE id=?', ctx.user.clientId)?.username ?? null, sheets };
     });

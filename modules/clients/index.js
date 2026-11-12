@@ -4,6 +4,7 @@ const accounts = require('../../core/accounts');
 const db = require('../../core/db');
 const notify = require('../../core/notify');
 const attachments = require('../../core/attachments');
+const clientAccounts = require('../../core/clientaccounts');
 const settings = require('../../core/settings');
 const { CURRENCIES, converter, converterTo } = require('../../core/currency');
 const { HttpError, str, int, num, date, oneOf, bad, today, addDays, round } = require('../../core/util');
@@ -19,6 +20,7 @@ const { HttpError, str, int, num, date, oneOf, bad, today, addDays, round } = re
  *   - The admin picks WHICH people work for a client (the team leader and members, chosen one by one). Only those people, the
  *     head of the department and the admin can see that client, its chat and its alerts. Nobody is added just because they are
  *     in the same team. Staff see only the client ID; the real name, contact and secret details are for the admin.
+ *   - One portal per client, one section per person who works for it: "Account 1", "Account 2" ... (never a name).
  *   - A chat is shared: everybody chosen for the client, the head of the department and the admin can read and write it.
  *   - Every client has a currency (AUD, USD or GBP) chosen by the admin: the client sees all its figures in it. An update has a
  *     currency too (it starts as the client's); one written in another currency is converted with the exchange rates in Settings.
@@ -246,6 +248,30 @@ module.exports = {
       try { cur = JSON.parse(d.get("SELECT value FROM settings WHERE key='currency'")?.value ?? '"USD"'); } catch { /* keep USD */ }
       if (['AUD', 'USD', 'GBP'].includes(cur) && cur !== 'USD') d.run('UPDATE clients SET currency=?', cur);
     },
+    // 10: one portal, a section ("Account N") for every person who writes for the client. Numbers follow the order in which people
+    // first wrote an update or sent a sheet, so they are 1, 2, 3 ... without gaps; what exists now gets its number, nothing is lost.
+    (d) => {
+      d.raw.exec(`CREATE TABLE client_accounts (
+        id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE, who TEXT NOT NULL, number INTEGER NOT NULL, created_at TEXT NOT NULL,
+        UNIQUE (client_id, who), UNIQUE (client_id, number));
+        ALTER TABLE client_reports ADD COLUMN account_no INTEGER;`);
+      const events = [];
+      const who = (id) => (id ? `e${id}` : 'x');
+      for (const r of d.all('SELECT client_id, submitted_by, MIN(created_at) AS at FROM client_reports GROUP BY client_id, submitted_by')) events.push({ clientId: r.clientId, who: who(r.submittedBy), at: r.at || '' });
+      for (const p of d.all('SELECT client_id, employee_id, MIN(published_at) AS at FROM sheet_publications GROUP BY client_id, employee_id')) events.push({ clientId: p.clientId, who: who(p.employeeId), at: p.at || '' });
+      events.sort((a, b) => a.clientId - b.clientId || a.at.localeCompare(b.at) || a.who.localeCompare(b.who));
+      const next = {};
+      const seen = new Set();
+      for (const e of events) {
+        const key = `${e.clientId}|${e.who}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        next[e.clientId] = (next[e.clientId] || 0) + 1;
+        d.run('INSERT INTO client_accounts(client_id, who, number, created_at) VALUES (?,?,?,?)', e.clientId, e.who, next[e.clientId], new Date().toISOString());
+      }
+      d.raw.exec(`UPDATE client_reports SET account_no = (SELECT a.number FROM client_accounts a WHERE a.client_id=client_reports.client_id AND a.who = COALESCE('e' || client_reports.submitted_by, 'x'));
+        UPDATE sheet_publications SET account_no = (SELECT a.number FROM client_accounts a WHERE a.client_id=sheet_publications.client_id AND a.who = COALESCE('e' || sheet_publications.employee_id, 'x'));`);
+    },
   ],
 
   routes(m) {
@@ -314,7 +340,7 @@ module.exports = {
     m.get('/api/clients/:id/staff', { roles: ['admin'] }, (ctx) => {
       const c = staffClient(ctx, ctx.params.id);
       const chosen = new Set(staffIds(c));
-      return { candidates: candidates(c.departmentId, c.teamId, c.id).map((e) => ({ ...e, chosen: chosen.has(e.id) })) };
+      return { candidates: candidates(c.departmentId, c.teamId, c.id).map((e) => ({ ...e, chosen: chosen.has(e.id), accountNo: clientAccounts.numberOf(c.id, e.id) })) };
     });
 
     // Add or remove people later: send the full list of people who should be in the client's chat.
@@ -422,7 +448,7 @@ module.exports = {
       if (ctx.user.role === 'member' && e.date < addDays(today(), -31)) throw bad('You can only add updates from the last 31 days');
       const now = new Date().toISOString();
       const label = ctx.user.role === 'admin' ? 'Administrator' : db.get('SELECT name FROM employees WHERE id=?', ctx.user.employeeId)?.name;
-      const r = db.insert('client_reports', { clientId: c.id, ...e, submittedBy: ctx.user.employeeId ?? null, submittedLabel: label, createdAt: now, updatedAt: now });
+      const r = db.insert('client_reports', { clientId: c.id, ...e, submittedBy: ctx.user.employeeId ?? null, submittedLabel: label, accountNo: clientAccounts.ensure(c.id, ctx.user.employeeId ?? null), createdAt: now, updatedAt: now });
       ctx.audit('client_update', 'client', c.id, `${c.username} ${e.date}: ${e.orders} orders, sales ${e.sales} ${e.currency}`, c.departmentId);
       return { id: r.id };
     });
@@ -533,7 +559,12 @@ module.exports = {
       if (from > to) throw bad('"To" cannot be before "From"');
       const conv = converterTo(c.currency);
       let converted = false;
-      const all = db.all('SELECT date, market, store, orders, investment, sales, note, currency FROM client_reports WHERE client_id=? ORDER BY date, id', c.id).map((r) => {
+      const everyRow = db.all('SELECT date, market, store, orders, investment, sales, note, currency, account_no FROM client_reports WHERE client_id=? ORDER BY date, id', c.id);
+      // the sections of this client's portal: one per account that has something to show (updates or a sheet)
+      const accountNos = [...new Set([...everyRow.map((r) => r.accountNo), ...db.all('SELECT account_no FROM sheet_publications WHERE client_id=?', c.id).map((r) => r.accountNo)].filter((n) => n != null))].sort((x, y) => x - y);
+      const askedAccount = ctx.query.account === undefined || ctx.query.account === '' || ctx.query.account === 'all' ? null : int(ctx.query.account, 'Account', { required: true });
+      if (askedAccount !== null && !accountNos.includes(askedAccount)) throw new HttpError(404, 'That section does not exist');
+      const all = everyRow.filter((r) => askedAccount === null || r.accountNo === askedAccount).map((r) => {
         if (r.currency === c.currency) return r;
         converted = true;
         return { ...r, investment: round(conv(r.investment, r.currency)), sales: round(conv(r.sales, r.currency)) };
@@ -556,7 +587,10 @@ module.exports = {
         total: { ...sums(all), since: all[0]?.date ?? null, days: new Set(all.map((r) => r.date)).size },
         range: sums(inRange), days, chart,
       };
-      return { username: c.username, departmentName: c.departmentName, currency: c.currency, from, to, date: day, converted, currencies: all.length ? [block] : [] };
+      return {
+        username: c.username, departmentName: c.departmentName, currency: c.currency, from, to, date: day, converted, currencies: all.length ? [block] : [],
+        accounts: accountNos.map((n) => ({ no: n, label: `Account ${n}` })), account: askedAccount === null ? 'all' : askedAccount,
+      };
     });
 
     m.get('/api/portal/summary', { roles: CLIENT }, (ctx) => {

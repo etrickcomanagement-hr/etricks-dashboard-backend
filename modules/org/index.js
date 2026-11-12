@@ -27,8 +27,8 @@ const TEAM_SELECT = `
          (SELECT COUNT(*) FROM employees e WHERE e.team_id=t.id AND e.role='member' AND e.status='active') AS member_count
     FROM teams t JOIN departments d ON d.id=t.department_id LEFT JOIN employees l ON l.id=t.leader_employee_id`;
 
-// One head and three team leaders per department; every team has exactly one leader, so three teams at most.
-const MAX_TEAMS_PER_DEPARTMENT = 3;
+// One head and up to ten team leaders per department; every team has exactly one leader, so ten teams at most.
+const MAX_TEAMS_PER_DEPARTMENT = 10;
 
 const randomHash = () => auth.hashSecret(auth.generatePassword(24)); // departments no longer have their own sign-in passwords
 
