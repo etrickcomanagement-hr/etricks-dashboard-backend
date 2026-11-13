@@ -739,7 +739,7 @@ async function main() {
       && (await W1('PUT', `/api/client-reports/${u3.data.id}`, { date: TODAY, orders: 1, investment: 20, sales: 50, currency: 'USD' })).status === 200 && (await W1('GET', `/api/client-reports?clientId=${cc.id}&from=${TODAY}&to=${TODAY}`)).data.rows.find((r) => r.id === u3.data.id).currency === 'USD'
       && (await W1('PUT', `/api/client-reports/${u3.data.id}`, { date: TODAY, orders: 1, sales: 50, currency: 'XYZ' })).status === 400);
     check('another client sees none of it, and deleting an update changes the one block', (await CL2('GET', '/api/portal/sales')).data.currencies.every((c) => c.total.sales !== 310) && (await W1('DELETE', `/api/client-reports/${u1.data.id}`)).status === 200 && (await CC('GET', '/api/portal/sales')).data.currencies[0].total.orders === 5);
-    check('the currencies are in the activity log, never the note', (await admin('GET', '/api/logs?limit=500')).data.some((l) => l.action === 'client_update' && /sales 300 AUD/.test(l.details || '')) && !JSON.stringify((await admin('GET', '/api/logs?limit=500')).data).includes('aussie today'));
+    check('the currencies are in the activity log, never the note', (await admin('GET', '/api/logs?limit=5000')).data.some((l) => l.action === 'client_update' && /sales 300 AUD/.test(l.details || '')) && !JSON.stringify((await admin('GET', '/api/logs?limit=5000')).data).includes('aussie today'));
     await admin('DELETE', `/api/clients/${cc.id}`);
     }
 
@@ -767,7 +767,7 @@ async function main() {
     const urgent = (await note(W1, /ALERT from client ali.traders/))[0];
     check('an alert raises an urgent notification for the whole team', urgent && urgent.body === 'Needs an immediate reply.' && (await note(leaderA2, /ALERT from client/)).length === 1 && (await note(admin, /ALERT from client/)).length === 1 && (await note(hodNew, /ALERT from client/)).length === 1 && (await note(bm, /ALERT/)).length === 0);
     check('SECRET: the alert text is not in notifications, the activity log or lists', !JSON.stringify((await admin('GET', '/api/notifications?limit=100')).data).includes('482913') && !JSON.stringify((await W1('GET', '/api/notifications?limit=100')).data).includes('482913')
-      && !JSON.stringify((await admin('GET', '/api/logs?limit=500')).data).includes('482913') && !JSON.stringify((await W1('GET', '/api/clients')).data).includes('482913'));
+      && !JSON.stringify((await admin('GET', '/api/logs?limit=5000')).data).includes('482913') && !JSON.stringify((await W1('GET', '/api/clients')).data).includes('482913'));
     const sum = (await W1('GET', '/api/client-alerts/summary')).data;
     check('the pages polling for alerts see it at once, only for their own clients', sum.alerts === 1 && sum.items[0].username === 'ali.traders' && !!sum.items[0].since && (await bm('GET', '/api/client-alerts/summary')).data.alerts === 0 && (await hod2('GET', '/api/client-alerts/summary')).data.alerts === 0);
     check('the answer clears the alert', (await W2('POST', `/api/clients/${c1.data.id}/chat`, { channel: 'alert', body: 'Received, thank you.' })).status === 200 && (await W1('GET', '/api/client-alerts/summary')).data.alerts === 0);
@@ -789,9 +789,12 @@ async function main() {
       && (await admin('GET', `/api/clients/candidates?departmentId=${ebayId}&teamId=${tZ}`)).status === 400);
     check('only the admin can open that list or change the people of a client', (await hodNew('GET', `/api/clients/candidates?departmentId=${ebayId}`)).status === 403 && (await leaderA2('PUT', `/api/clients/${c1.data.id}/staff`, { employeeIds: [] })).status === 403
       && (await W2('GET', `/api/clients/${c1.data.id}/staff`)).status === 403);
-    check('people of another team cannot be chosen for a team client', (await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [bina.data.id], username: 'pick.bad', password: cpw })).status === 400
+    const pickOther = await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [bina.data.id, lz.data.id], username: 'pick.other', password: cpw });
+    check('people of another team AND of another department can be chosen for a client; only real, active leaders and members', pickOther.status === 200 && (await admin('GET', `/api/clients/${pickOther.data.id}/staff`)).data.candidates.filter((e) => e.chosen).map((e) => e.name).sort().join() === 'Bina Khan,Zed Lead'
       && (await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: ['x'], username: 'pick.bad', password: cpw })).status === 400
+      && (await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [99999], username: 'pick.bad', password: cpw })).status === 400
       && (await admin('GET', '/api/clients')).data.every((c) => c.username !== 'pick.bad'));
+    await admin('DELETE', `/api/clients/${pickOther.data.id}`);
     const c4 = await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [w2.data.id], username: 'select.test', password: cpw });
     check('a client can be created with only the chosen people', c4.status === 200 && (await admin('GET', '/api/clients')).data.find((c) => c.id === c4.data.id).staffCount === 1);
     const see = async (c) => (await c('GET', `/api/clients/${c4.data.id}/chat?channel=inquiry`)).status;
@@ -810,8 +813,8 @@ async function main() {
       && (await leaderA2('GET', '/api/client-alerts/summary')).data.items.some((i) => i.username === 'select.test'));
     check('the admin removes a member later: access ends at once and they are told', (await admin('PUT', `/api/clients/${c4.data.id}/staff`, { employeeIds: [la.data.id] })).data.removed === 1 && await see(W2) === 404 && (await note(W2, /You were removed from client select.test/)).length === 1 && !(await ids(W2)).includes('select.test'));
     check('the admin sees who is chosen', (await admin('GET', `/api/clients/${c4.data.id}/staff`)).data.candidates.filter((e) => e.chosen).map((e) => e.name).join() === 'Lina Lead');
-    check('with nobody chosen only the head and the admin see the client', (await admin('PUT', `/api/clients/${c4.data.id}/staff`, { employeeIds: [] })).data.total === 0 && await see(leaderA2) === 404 && await see(hodNew) === 200 && (await admin('PUT', `/api/clients/${c4.data.id}/staff`, { employeeIds: [bina.data.id] })).status === 400);
-    check('changing the people is written to the activity log', (await admin('GET', '/api/logs?limit=500')).data.some((l) => l.action === 'client_team_changed'));
+    check('with nobody chosen only the head and the admin see the client', (await admin('PUT', `/api/clients/${c4.data.id}/staff`, { employeeIds: [] })).data.total === 0 && await see(leaderA2) === 404 && await see(hodNew) === 200 && (await admin('PUT', `/api/clients/${c4.data.id}/staff`, { employeeIds: [bina.data.id] })).status === 200 && await see(bm) === 200 && (await admin('PUT', `/api/clients/${c4.data.id}/staff`, { employeeIds: [] })).status === 200 && await see(bm) === 404);
+    check('changing the people is written to the activity log', (await admin('GET', '/api/logs?limit=5000')).data.some((l) => l.action === 'client_team_changed'));
     await admin('DELETE', `/api/clients/${c4.data.id}`);
 
     console.log('Chat of a client: everybody chosen reads and writes, nobody "owns" it');
@@ -841,7 +844,7 @@ async function main() {
     check('the client sees one chat, written by "eTricks", never a name', (await CL5('GET', '/api/portal/chat?channel=inquiry')).data.messages.length === 9 && !/Worker|Lina|Hamza/.test(JSON.stringify((await CL5('GET', '/api/portal/chat?channel=inquiry')).data)));
     check('the old owner system is gone: no release, no hand-over, no chat owner anywhere', (await W2('POST', `/api/clients/${c5.data.id}/chat/release`, {})).status === 404 && (await admin('PUT', `/api/clients/${c5.data.id}/chat-owner`, { employeeId: w2.data.id })).status === 404);
     check('a person taken off the client loses its chat at once; the others keep it', (await admin('PUT', `/api/clients/${c5.data.id}/staff`, { employeeIds: [la.data.id, w1.data.id] })).status === 200 && await code5(W1) === 200 && await code5(W2) === 404 && (await post5(W2, 'still here?')).status === 404 && await code5(leaderA2) === 200);
-    const acts = (await admin('GET', '/api/logs?limit=500')).data.map((l) => l.action);
+    const acts = (await admin('GET', '/api/logs?limit=5000')).data.map((l) => l.action);
     check('answering is logged without the text; nothing is "taken" any more', acts.includes('client_message_sent') && !acts.includes('client_chat_taken'));
     await admin('DELETE', `/api/clients/${c5.data.id}`);
 
@@ -1025,8 +1028,8 @@ async function main() {
     check('too big is refused with a clear message (picture 4 MB, voice 3 MB)', /too big/.test((await cfPost('x', att(bigImg))).data.error) && /voice note is too big/.test((await cfPost('x', att(bigAud))).data.error) && (await sPost(S1, 'x', att(bigImg))).status === 400);
     check('a huge request is cut off', (await cfPost('x', { data: 'A'.repeat(9_000_000) })).status === 413);
     check('after all that refusing, the chat is intact (4 good messages, nothing half-saved)', (await S1('GET', `/api/clients/${cf.id}/chat?channel=inquiry`)).data.messages.length === 3 && (await S1('GET', `/api/clients/${cf.id}/chat?channel=alert`)).data.messages.length === 1);
-    check('no file bytes and no text in notifications or the activity log', !JSON.stringify((await admin('GET', '/api/notifications?limit=100')).data).includes('screenshot') && !JSON.stringify((await admin('GET', '/api/logs?limit=500')).data).includes('screenshot')
-      && (await admin('GET', '/api/logs?limit=500')).data.some((l) => /files\.test \(image\)/.test(l.details || '')) && (await admin('GET', '/api/logs?limit=500')).data.some((l) => /files\.test \(audio\)/.test(l.details || '')));
+    check('no file bytes and no text in notifications or the activity log', !JSON.stringify((await admin('GET', '/api/notifications?limit=100')).data).includes('screenshot') && !JSON.stringify((await admin('GET', '/api/logs?limit=5000')).data).includes('screenshot')
+      && (await admin('GET', '/api/logs?limit=5000')).data.some((l) => /files\.test \(image\)/.test(l.details || '')) && (await admin('GET', '/api/logs?limit=5000')).data.some((l) => /files\.test \(audio\)/.test(l.details || '')));
     check('everybody chosen, the head and the admin open the files; others do not', (await S1('GET', fileUrlS)).status === 200 && (await admin('GET', fileUrlS)).status === 200 && (await leaderA2('GET', fileUrlS)).status === 200 && (await hodNew('GET', fileUrlS)).status === 200 && (await bm('GET', fileUrlS)).status === 404);
     const adminRowCf = (await admin('GET', '/api/clients')).data.find((c) => c.id === cf.id);
     const adminThread = (await admin('GET', `/api/clients/${cf.id}/chat?channel=inquiry`)).data;
@@ -1099,6 +1102,37 @@ async function main() {
       await admin('DELETE', `/api/clients/${ca.id}`); await admin('DELETE', `/api/clients/${cb.id}`);
     }
 
+    console.log('A client can have people of any department');
+    {
+      const zm = (await leaderZ('POST', '/api/employees', { name: 'Zeta Member', joinDate: YESTERDAY })).data; // a member of ANOTHER department (Amazon)
+      const ZM = client();
+      await ZM('POST', '/api/auth/login', { portal: 'member', departmentId: amazonId, password: 'ZetaTeam-Pass-1', employeeId: zm.id, pin: zm.pin });
+      const cx = (await admin('POST', '/api/clients', { departmentId: ebayId, teamId: tA, staffIds: [zm.id, lz.data.id, w1.data.id], username: 'xdept.client', password: cpw })).data;
+      const CX = client(); await CX('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'xdept.client', password: cpw });
+      const names = async (c) => (await c('GET', '/api/clients')).data.map((x) => x.username);
+      const allPeople = (await admin('GET', '/api/clients/candidates')).data;
+      check('the list of people has every department, with the department of each person; it can still be narrowed to one', new Set(allPeople.map((e) => e.departmentName)).size >= 2 && allPeople.every((e) => e.departmentName && e.departmentId) && allPeople.some((e) => e.name === 'Zeta Member')
+        && (await admin('GET', `/api/clients/candidates?departmentId=${amazonId}`)).data.every((e) => e.departmentId === amazonId) && (await admin('GET', `/api/clients/${cx.id}/staff`)).data.candidates.some((e) => e.name === 'Zed Lead' && e.chosen && e.departmentName));
+      check('a member and a leader of another department see that client (and only the clients chosen for them)', (await names(ZM)).join() === 'xdept.client' && (await names(leaderZ)).includes('xdept.client') && !(await names(leaderZ)).includes('ali.traders') && !(await names(ZM)).includes('ali.traders'));
+      check('the head of the client\'s department sees it; the head of the members\' department does not; the admin does', (await names(hodNew)).includes('xdept.client') && !(await names(hod2)).includes('xdept.client') && (await names(admin)).includes('xdept.client'));
+      await CX('POST', '/api/portal/chat', { channel: 'inquiry', body: 'Hello from the client' });
+      check('they read the chat, answer it, are told when the client writes; the other department\'s head is not', (await ZM('GET', `/api/clients/${cx.id}/chat?channel=inquiry`)).data.messages.length === 1 && (await ZM('POST', `/api/clients/${cx.id}/chat`, { channel: 'inquiry', body: 'Answer from another department' })).status === 200
+        && (await leaderZ('GET', `/api/clients/${cx.id}/chat?channel=inquiry`)).data.messages.length === 2 && (await note(ZM, /New message from client xdept.client/)).length === 1 && (await note(hod2, /xdept.client/)).length === 0 && (await hod2('GET', `/api/clients/${cx.id}/chat?channel=inquiry`)).status === 404);
+      check('the client sees "eTricks", never a name, and nothing about the department of the person', (await CX('GET', '/api/portal/chat?channel=inquiry')).data.messages.length === 2 && !/Zeta|Zed|Amazon/i.test(JSON.stringify((await CX('GET', '/api/portal/chat?channel=inquiry')).data)));
+      check('they write client updates, and the client sees them in an Account of its own', (await ZM('POST', '/api/client-reports', { clientId: cx.id, date: TODAY, orders: 4, investment: 20, sales: 80, note: 'from another department' })).status === 200 && (await CX('GET', '/api/portal/sales')).data.currencies[0].total.orders === 4
+        && (await CX('GET', '/api/portal/sales')).data.accounts.length === 1 && !/Zeta|Amazon/i.test(JSON.stringify((await CX('GET', '/api/portal/sales')).data)));
+      check('they have the client\'s own sheet in their Daily Reports, write rows, and send it to the client', (await ZM('GET', '/api/orders/me')).data.clients.map((c) => c.username).join() === 'xdept.client'
+        && (await ZM('POST', '/api/orders', { clientId: cx.id, date: TODAY, orders: 2, investment: 10, revenue: 40, orderId: 'XD-1' })).status === 200 && (await ZM('POST', '/api/orders/publish', { clientId: cx.id })).status === 200
+        && (await CX('GET', '/api/portal/sheet')).data.sheets[0].rows[0].orderId === 'XD-1' && (await CX('GET', '/api/portal/sheet')).data.sheets[0].title === 'Account 1');
+      check('a leader or member of another department who was NOT chosen sees nothing of it', (await ZM('GET', `/api/clients/${(await admin('GET', '/api/clients')).data.find((c) => c.username === 'ali.traders').id}/chat?channel=inquiry`)).status === 404);
+      check('the client\'s own department head sees the member\'s sheet only through the client; the members\' head cannot open it', (await hod2('POST', '/api/client-reports', { clientId: cx.id, date: TODAY, orders: 1, sales: 1 })).status === 404);
+      check('moving the client to the members\' department keeps its people; heads swap', (await admin('PUT', `/api/clients/${cx.id}`, { departmentId: amazonId, teamId: null })).status === 200 && (await names(hod2)).includes('xdept.client') && !(await names(hodNew)).includes('xdept.client') && (await names(ZM)).join() === 'xdept.client' && (await names(W1)).includes('xdept.client'));
+      check('taking the person off ends their access at once, and they are told', (await admin('PUT', `/api/clients/${cx.id}/staff`, { employeeIds: [lz.data.id, w1.data.id] })).status === 200 && (await names(ZM)).length === 0 && (await ZM('GET', `/api/clients/${cx.id}/chat?channel=inquiry`)).status === 404 && (await note(ZM, /You were removed from client xdept.client/)).length === 1);
+      check('someone who is not a team leader or member (a head) cannot be chosen', (await admin('PUT', `/api/clients/${cx.id}/staff`, { employeeIds: [(await admin('GET', '/api/departments')).data.find((d) => d.id === amazonId).headId] })).status === 400);
+      await admin('DELETE', `/api/clients/${cx.id}`);
+      await leaderZ('DELETE', `/api/employees/${zm.id}`);
+    }
+
     check('removing a client keeps the member\'s rows (they move to the general sheet) and removes the copy', (await admin('DELETE', `/api/clients/${cs2.data.id}`)).status === 200 && (await S1('GET', `/api/orders/me?${RANGE}&client=general`)).data.rows.length === 1 && (await S1('GET', `/api/orders/me?${RANGE}&client=general`)).data.hasGeneral === true);
     check('what the client was sent stays when the person who wrote it is deleted; the member\'s own rows go', (await leaderA2('DELETE', `/api/employees/${sh1.id}`)).status === 200 && (await csheet()).sheets.length === 1 && (await csheet()).sheets[0].rows.length === 3 && (await admin('GET', `/api/orders?${RANGE}&search=Sheet One`)).data.rows.length === 0);
     check('removing the client removes its copy', (await admin('DELETE', `/api/clients/${cs.data.id}`)).status === 200);
@@ -1107,8 +1141,8 @@ async function main() {
 
     console.log('Client accounts');
     check('the admin edits a client (name, contact, secret, team)', (await admin('PUT', `/api/clients/${c1.data.id}`, { displayName: 'Ali Traders Group', contact: '0301-1111111', secretInfo: 'New secret', teamId: tA })).status === 200 && (await admin('GET', `/api/clients/${c1.data.id}/secret`)).data.secretInfo === 'New secret');
-    check('moving the client to another team hides it from the old team and nobody of the new team gets it by themselves', (await admin('PUT', `/api/clients/${c1.data.id}`, { teamId: tB })).status === 200 && await ids(W1) === c2.data.username && !(await ids(bm)).includes('ali.traders')
-      && (await admin('GET', `/api/clients/${c1.data.id}/staff`)).data.candidates.every((e) => !e.chosen));
+    check('moving the client to another team keeps the people chosen for it (they are chosen one by one, whatever their team)', (await admin('PUT', `/api/clients/${c1.data.id}`, { teamId: tB })).status === 200 && (await ids(W1)).includes('ali.traders') && !(await ids(bm)).includes('ali.traders')
+      && (await admin('GET', `/api/clients/${c1.data.id}/staff`)).data.candidates.filter((e) => e.chosen).length === 3);
     await admin('PUT', `/api/clients/${c1.data.id}`, { teamId: tA, staffIds: [la.data.id, w1.data.id, w2.data.id] });
     check('a new password signs the client out and the old one stops working', (await admin('PUT', `/api/clients/${c1.data.id}/password`, { password: 'BrandNew-Pass-9' })).status === 200 && (await CL('GET', '/api/portal/sales')).status === 401
       && (await client()('POST', '/api/auth/login', { portal: 'client', departmentId: ebayId, username: 'ali.traders', password: cpw })).status === 401);
@@ -1122,7 +1156,7 @@ async function main() {
     const cTeam = await admin('POST', '/api/clients', { departmentId: amazonId, teamId: tEmpty.id, username: 'team.client', password: cpw });
     check('a team that still has a client cannot be deleted (and nothing crashes)', cTeam.status === 200 && (await hod2('DELETE', `/api/teams/${tEmpty.id}`)).status === 400 && (await admin('DELETE', `/api/clients/${cTeam.data.id}`)).status === 200 && (await hod2('DELETE', `/api/teams/${tEmpty.id}`)).status === 200);
     check('the admin deletes a client with everything of it', (await admin('DELETE', `/api/clients/${c3.data.id}`)).status === 200 && (await admin('GET', '/api/clients')).data.length === 2 && (await W2('DELETE', `/api/clients/${c2.data.id}`)).status === 403);
-    check('client activity is in the log without any message text', (await admin('GET', '/api/logs?limit=500')).data.some((l) => l.action === 'client_created') && (await admin('GET', '/api/logs?limit=500')).data.some((l) => l.action === 'client_alert'));
+    check('client activity is in the log without any message text', (await admin('GET', '/api/logs?limit=5000')).data.some((l) => l.action === 'client_created') && (await admin('GET', '/api/logs?limit=5000')).data.some((l) => l.action === 'client_alert'));
     const cLock = await admin('POST', '/api/clients', { departmentId: ebayId, username: 'lock.test', password: cpw });
     const guesser2 = client();
     let lastC;
@@ -1214,13 +1248,14 @@ async function main() {
     check('only the people above set pay; a member sees how they are paid and this month so far', (await SB('PUT', '/api/salaries/rate', { refId: pB.id, payType: 'fixed', amount: 9999 })).status === 403 && meB.payType === 'percent' && meB.percent === 10 && meB.thisMonth.profit === 665 && meB.thisMonth.commission === 66.5 && /10% of the profit/.test(meB.payText)
       && (await leaderB('PUT', '/api/salaries/rate', { refId: pB.id, payType: 'fixed', amount: 9999 })).status === 403);
     check('the salary export says how each person is paid', /Paid how,Fixed salary,Percentage of profit,Profit this month,Commission this month/.test((await leaderA2('GET', `/api/salaries?period=${payPer}&format=csv`)).data));
-    const logsPay = JSON.stringify((await admin('GET', '/api/logs?limit=500')).data);
+    const logsPay = JSON.stringify((await admin('GET', '/api/logs?limit=5000')).data);
     check('the way of payment is in the activity log', logsPay.includes('salary_set') && logsPay.includes('paid: 500 + 5%'));
     for (const x of [pA, pB, pC, pD, pE]) await leaderA2('POST', `/api/employees/${x.id}/status`, { status: 'inactive' }); // people who were paid are deactivated, not deleted
 
     console.log('Admin, logs, backups');
-    const logs = (await admin('GET', '/api/logs?limit=500')).data;
-    check('activity log captured actions', logs.length > 10 && logs.some((l) => l.action === 'login') && logs.some((l) => l.action === 'login_failed') && logs.some((l) => l.action === 'transfer') && logs.some((l) => l.action === 'password_changed'));
+    const logs = (await admin('GET', '/api/logs?limit=5000')).data;
+    const logged = async (action) => (await admin('GET', `/api/logs?action=${action}&limit=1`)).data.length === 1; // asked one by one: the log is long by now
+    check('activity log captured actions', logs.length > 10 && await logged('login') && await logged('login_failed') && await logged('transfer') && await logged('password_changed'));
     check('head sees only own department log; leaders have none', (await hodNew('GET', '/api/logs')).data.every((l) => l.departmentId === ebayId) && (await leaderA2('GET', '/api/logs')).status === 403);
     check('manual backup (pressed twice in a second is fine)', (await admin('POST', '/api/backups')).status === 200 && (await admin('POST', '/api/backups')).status === 200);
     check('backup list', (await admin('GET', '/api/backups')).data.length >= 2);
@@ -1265,7 +1300,7 @@ async function main() {
     })());
     check('after downloading, the admin can delete it from the server (the file goes, the history stays)', (await admin('DELETE', `/api/backups/full/${fbId}`)).status === 200 && !fs.existsSync(path.join(DATA, 'backups', 'full', fbNew.data.name))
       && (await admin('GET', '/api/backups/full')).data.items.find((x) => x.id === fbId).status === 'deleted' && (await admin('GET', `/api/backups/full/${fbId}/download`)).status === 404 && (await admin('DELETE', `/api/backups/full/${fbId}`)).status === 404);
-    const flog = (await admin('GET', '/api/logs?limit=500')).data;
+    const flog = (await admin('GET', '/api/logs?limit=5000')).data;
     check('every step is in the activity log', ['backup_full_created', 'backup_full_download_started', 'backup_full_downloaded', 'backup_full_deleted'].every((a) => flog.some((l) => l.action === a)));
     check('disable a module', (await admin('PUT', '/api/modules/finance', { enabled: false })).status === 200 && (await leaderA2('GET', '/api/finance')).status === 404);
     await admin('PUT', '/api/modules/finance', { enabled: true });
@@ -1333,7 +1368,7 @@ async function main() {
     let lastG; for (let i = 0; i < 7; i++) lastG = await gateGuesser('POST', '/api/gate', { password: 'guess-guess-' + i });
     check('guessing the access password is locked after repeated failures', lastG.status === 429);
     await admin('DELETE', '/api/gate');
-    check('the access password was written to the log without the password', (await admin('GET', '/api/logs?limit=500')).data.some((l) => l.action === 'gate_changed') && !JSON.stringify((await admin('GET', '/api/logs?limit=500')).data).includes('Gate-pass'));
+    check('the access password was written to the log without the password', (await admin('GET', '/api/logs?limit=5000')).data.some((l) => l.action === 'gate_changed') && !JSON.stringify((await admin('GET', '/api/logs?limit=5000')).data).includes('Gate-pass'));
 
     console.log('Brute force lock');
     const attacker = client();

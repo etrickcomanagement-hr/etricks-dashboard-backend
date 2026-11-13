@@ -113,10 +113,11 @@ module.exports = {
       'SELECT id, label, kind, client_visible, position FROM order_columns WHERE employee_id=? AND client_id IS ? ORDER BY position, id', employeeId, clientId ?? null)
       .map((c) => ({ id: c.id, label: c.label, kind: c.kind, clientVisible: !!c.clientVisible }));
     // The clients a person works for (the admin chose them): each is a sheet of its own.
-    const clientsOf = (employeeId, departmentId) => db.all(
+    // (from any department: the admin may choose a person of another department for a client)
+    const clientsOf = (employeeId) => db.all(
       `SELECT c.id, c.username FROM client_staff s JOIN clients c ON c.id=s.client_id
-        WHERE s.employee_id=? AND c.status='active' AND c.department_id=? ORDER BY c.username`, employeeId, departmentId);
-    const myClients = (ctx) => clientsOf(ctx.user.employeeId, ctx.user.departmentId);
+        WHERE s.employee_id=? AND c.status='active' ORDER BY c.username`, employeeId);
+    const myClients = (ctx) => clientsOf(ctx.user.employeeId);
 
     // Which sheet something belongs to. With exactly one client that is simply the sheet; with several the screen says which.
     const sheetClient = (ctx, requested) => {
@@ -199,7 +200,7 @@ module.exports = {
 
     // Which sheets a person has: one per client they work for, and the general sheet when they have no client or rows without one.
     const sheetTabs = (employeeId, departmentId) => {
-      const clients = clientsOf(employeeId, departmentId);
+      const clients = clientsOf(employeeId);
       const general = clients.length === 0 || db.get('SELECT 1 AS x FROM member_orders WHERE employee_id=? AND client_id IS NULL LIMIT 1', employeeId)
         || db.get('SELECT 1 AS x FROM order_columns WHERE employee_id=? AND client_id IS NULL LIMIT 1', employeeId);
       return { clients, hasGeneral: !!general };
