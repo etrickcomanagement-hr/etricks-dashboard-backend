@@ -1,5 +1,8 @@
 'use strict';
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const { promisify } = require('node:util');
 const db = require('./db');
 const config = require('./config');
 const { HttpError } = require('./util');
@@ -15,6 +18,31 @@ function verifySecret(secret, stored) {
   if (v !== 's1') return false;
   const calc = crypto.scryptSync(String(secret), Buffer.from(salt, 'hex'), 64);
   return crypto.timingSafeEqual(calc, Buffer.from(hash, 'hex'));
+}
+// The same check, but done on a worker thread: while a password is being checked (it takes 50-200 ms on purpose) the server keeps
+// answering everybody else. The sign-in uses this; the synchronous one above is only for rare jobs (setting a password).
+const scryptAsync = promisify(crypto.scrypt);
+async function verifySecretAsync(secret, stored) {
+  if (!stored) return false;
+  const [v, salt, hash] = stored.split('$');
+  if (v !== 's1') return false;
+  const calc = await scryptAsync(String(secret), Buffer.from(salt, 'hex'), 64);
+  return crypto.timingSafeEqual(calc, Buffer.from(hash, 'hex'));
+}
+
+// A key that lives in the data folder, NOT in the database: with it a password gets a short "tag" so the sign-in can find which of
+// the ten team leaders / teams a password belongs to by one lookup instead of checking all of them (ten slow checks). The tag only
+// narrows the search: the password is still checked properly afterwards. A copy of the database alone says nothing about passwords.
+let loginKey = null;
+function tagOf(secret) {
+  if (!loginKey) {
+    const file = path.join(config.dataDir, '.login-key');
+    try { loginKey = fs.readFileSync(file); } catch {
+      loginKey = crypto.randomBytes(32);
+      try { fs.writeFileSync(file, loginKey, { mode: 0o600 }); } catch { /* read-only folder: the key lives as long as the process */ }
+    }
+  }
+  return crypto.createHmac('sha256', loginKey).update(String(secret)).digest('hex');
 }
 const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
 
@@ -85,4 +113,4 @@ function generatePassword(len = 12) {
 }
 const generatePin = () => String(crypto.randomInt(0, 1000000)).padStart(6, '0');
 
-module.exports = { hashSecret, verifySecret, createSession, sessionFromToken, destroySession, purgeSessions, throttle, generatePassword, generatePin };
+module.exports = { hashSecret, verifySecret, verifySecretAsync, tagOf, createSession, sessionFromToken, destroySession, purgeSessions, throttle, generatePassword, generatePin };

@@ -118,12 +118,12 @@ module.exports = {
       db.all('SELECT id, name, slug, color FROM departments WHERE active=1 ORDER BY sort, name'));
 
     // Team members: step 1 - the team's member password opens the list of that team's names.
-    m.post('/api/auth/members', (ctx) => {
+    m.post('/api/auth/members', async (ctx) => {
       const deptId = int(ctx.body.departmentId, 'Department', { required: true });
       const key = `members|${ctx.ip}|${deptId}`;
       auth.throttle.check(key);
       activeDepartment(deptId);
-      const team = accounts.findTeamByPassword(deptId, String(ctx.body.password || ''));
+      const team = await accounts.findTeamByPasswordAsync(deptId, String(ctx.body.password || ''));
       if (!team) {
         auth.throttle.fail(key);
         throw new HttpError(401, 'Incorrect password');
@@ -135,7 +135,7 @@ module.exports = {
       };
     });
 
-    m.post('/api/auth/login', (ctx) => {
+    m.post('/api/auth/login', async (ctx) => {
       const portal = oneOf(ctx.body.portal, 'Portal', ['admin', 'hod', 'leader', 'member', 'client'], { required: true });
       const password = String(ctx.body.password || '');
       if (!password) throw bad('Password is required');
@@ -150,7 +150,7 @@ module.exports = {
       };
 
       if (portal === 'admin') {
-        if (!auth.verifySecret(password, settings.get('adminHash'))) denied();
+        if (!(await auth.verifySecretAsync(password, settings.get('adminHash')))) denied();
         auth.throttle.ok(key);
         startSession(ctx, { role: 'admin', label: 'Administrator' });
         ctx.audit('login', 'portal', null, 'Admin portal');
@@ -167,7 +167,7 @@ module.exports = {
         auth.throttle.check(ckey);
         const c = db.get('SELECT * FROM clients WHERE username=? AND department_id=?', username, deptId);
         // always do the same amount of work, so a wrong ID cannot be told apart from a wrong password
-        const ok = auth.verifySecret(password, c ? c.passwordHash : DUMMY_HASH) && !!c && c.status === 'active';
+        const ok = (await auth.verifySecretAsync(password, c ? c.passwordHash : DUMMY_HASH)) && !!c && c.status === 'active';
         if (!ok) { auth.throttle.fail(ckey); denied('Incorrect client ID or password'); }
         auth.throttle.ok(ckey); auth.throttle.ok(key);
         db.update('clients', c.id, { lastLoginAt: new Date().toISOString() });
@@ -178,7 +178,7 @@ module.exports = {
 
       // Head of department / team leader: one password each; the password tells us who is signing in.
       if (portal === 'hod' || portal === 'leader') {
-        const person = accounts.findEmployeeByPassword(deptId, portal === 'hod' ? 'hod' : 'team_leader', password);
+        const person = await accounts.findEmployeeByPasswordAsync(deptId, portal === 'hod' ? 'hod' : 'team_leader', password);
         if (!person) denied();
         auth.throttle.ok(key);
         startSession(ctx, { role: portal, departmentId: deptId, employeeId: person.id, label: LABELS[portal](person.name) });
@@ -187,13 +187,13 @@ module.exports = {
       }
 
       // Member: the team's member password (it identifies the team) + the person's own PIN.
-      const team = accounts.findTeamByPassword(deptId, password);
+      const team = await accounts.findTeamByPasswordAsync(deptId, password);
       if (!team) denied();
       const employeeId = int(ctx.body.employeeId, 'Employee', { required: true });
       const pinKey = `pin|${ctx.ip}|${employeeId}`;
       auth.throttle.check(pinKey);
       const emp = db.get("SELECT * FROM employees WHERE id=? AND team_id=? AND role='member' AND status='active'", employeeId, team.id);
-      if (!emp || !auth.verifySecret(String(ctx.body.pin || ''), emp.pinHash)) {
+      if (!emp || !(await auth.verifySecretAsync(String(ctx.body.pin || ''), emp.pinHash))) {
         auth.throttle.fail(pinKey);
         denied('Incorrect PIN');
       }

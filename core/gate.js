@@ -57,6 +57,6 @@ function clear() {
 const status = () => ({ enabled: enabled(), setAt: enabled() ? settings.get('gateSetAt') || null : null });
 
 // Calls that stay open without the password (the website asks them to find out whether to show the password page).
-const OPEN = new Set(['/api/health', '/api/gate', '/api/auth/me']);
+const OPEN = new Set(['/api/health', '/api/gate', '/api/auth/me', '/api/public/client-error']);
 
 module.exports = { enabled, passed, check, set, clear, status, cookieHeader, OPEN };

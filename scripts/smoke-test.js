@@ -721,6 +721,11 @@ async function main() {
     const staffCc = (await W1('GET', `/api/client-reports?clientId=${cc.id}&from=${YESTERDAY}&to=${TODAY}`)).data;
     check('an update without a currency starts in the CLIENT\'s currency; every row keeps the currency it was written in', u4.status === 200 && staffCc.rows.find((r) => r.id === u4.data.id).currency === 'AUD' && staffCc.rows.find((r) => r.id === u1.data.id).currency === 'USD' && staffCc.rows.find((r) => r.id === u3.data.id).currency === 'GBP');
     await W1('DELETE', `/api/client-reports/${u4.data.id}`);
+    const blanks = await addCu({ orders: '', investment: '', sales: '12.5', currency: 'AUD' }); // a form with empty boxes sends empty text, not 0: that used to be a server error
+    const blanks2 = await addCu({ orders: '', investment: '', sales: '', note: 'only a note' });
+    check('empty boxes in an update count as 0 (no "something went wrong"); a completely empty update is still refused', blanks.status === 200 && blanks2.status === 200 && (await addCu({ orders: '', investment: '', sales: '' })).status === 400
+      && (await W1('GET', `/api/client-reports?clientId=${cc.id}&from=${TODAY}&to=${TODAY}`)).data.rows.find((r) => r.id === blanks.data.id).orders === 0);
+    await W1('DELETE', `/api/client-reports/${blanks.data.id}`); await W1('DELETE', `/api/client-reports/${blanks2.data.id}`);
     const cs3 = (await CC('GET', '/api/portal/sales')).data;
     const blk = cs3.currencies[0];
     const todaySales = r2(300) + r2(into(30, 'USD', 'AUD')) + r2(into(50, 'GBP', 'AUD'));
@@ -1251,6 +1256,39 @@ async function main() {
     const logsPay = JSON.stringify((await admin('GET', '/api/logs?limit=5000')).data);
     check('the way of payment is in the activity log', logsPay.includes('salary_set') && logsPay.includes('paid: 500 + 5%'));
     for (const x of [pA, pB, pC, pD, pE]) await leaderA2('POST', `/api/employees/${x.id}/status`, { status: 'inactive' }); // people who were paid are deactivated, not deleted
+
+    console.log('Speed and reliability: sign-in off the main thread, health, the server watching itself');
+    {
+      const tP = (await hod2('POST', '/api/teams', { name: 'Perf' })).data.id;
+      await hod2('POST', `/api/teams/${tP}/leader`, { name: 'Perf Lead', password: 'PerfLead-Pass-1' });
+      const { DatabaseSync } = require('node:sqlite');
+      const tags = () => { const d = new DatabaseSync(path.join(DATA, 'etricks.db')); try { return Number(d.prepare('SELECT COUNT(*) AS n FROM password_tags').get().n); } finally { d.close(); } };
+      const before = tags();
+      const lead1 = await as('leader', amazonId, 'PerfLead-Pass-1');
+      check('the first sign-in of a leader works and remembers which password it was (one lookup next time)', lead1.login.status === 200 && lead1.login.data.user.name === 'Perf Lead' && tags() === before + 1);
+      check('the second sign-in finds the leader by that memory, with the same result; a wrong password is still refused', (await as('leader', amazonId, 'PerfLead-Pass-1')).login.status === 200 && (await as('leader', amazonId, 'PerfLead-Pass-X')).login.status === 401 && (await as('leader', amazonId, 'LeadZ-Pass-1')).login.data.user.name === 'Zed Lead');
+      const perfId = lead1.login.data.user.employeeId;
+      check('after the password is changed only the new one works, also on the first try (nothing stale is trusted)', (await hod2('PUT', `/api/employees/${perfId}/password`, { password: 'PerfLead-New-2' })).status === 200 && (await as('leader', amazonId, 'PerfLead-Pass-1')).login.status === 401
+        && (await as('leader', amazonId, 'PerfLead-New-2')).login.status === 200 && (await as('leader', amazonId, 'PerfLead-New-2')).login.status === 200);
+      const burst = await Promise.all(Array.from({ length: 12 }, () => as('leader', amazonId, 'PerfLead-New-2')));
+      check('twelve people signing in at the same moment all get in (and the server keeps answering meanwhile)', burst.every((c) => c.login.status === 200));
+      const t0 = Date.now();
+      const during = await Promise.all([...Array.from({ length: 8 }, () => as('leader', amazonId, 'PerfLead-New-2')), (async () => { const t = Date.now(); await anon('GET', '/api/health'); return Date.now() - t; })()]);
+      check('while people sign in, an ordinary request is answered at once (sign-in does not freeze the server)', during[8] < 800 && Date.now() - t0 < 8000, `${during[8]} ms`);
+      const hl = await anon('GET', '/api/health');
+      check('the health page answers only when the database answers', hl.status === 200 && hl.data.ok === true && Number.isFinite(hl.data.uptime));
+      const mt = (await admin('GET', '/api/metrics')).data;
+      check('the server keeps count of itself: requests, slowest routes, how long it was stuck, memory', mt.requests > 100 && mt.routes.length > 5 && mt.routes.every((r) => r.calls > 0 && r.p95Ms >= 0 && r.maxMs >= 0) && mt.eventLoop.maxMs >= 0 && mt.memoryMb.rss > 10 && mt.uptimeSeconds >= 0 && mt.routes.some((r) => /auth\/login/.test(r.route)));
+      check('only the admin can read it, or reset it', (await hodNew('GET', '/api/metrics')).status === 403 && (await anon('GET', '/api/metrics')).status === 401 && (await hodNew('POST', '/api/metrics/reset')).status === 403);
+      check('a screen that failed in a browser is reported without signing in; only a little, and only so much from one visitor', (await anon('POST', '/api/public/client-error', { message: 'Cannot read properties of undefined', where: 'clients.js:99', page: '#/portal-sales', role: 'client', agent: 'TestBrowser' })).status === 200
+        && (await admin('GET', '/api/metrics')).data.browserErrors.recent.some((e) => e.message === 'Cannot read properties of undefined' && e.page === '#/portal-sales' && e.role === 'client'));
+      for (let n = 0; n < 15; n++) await anon('POST', '/api/public/client-error', { message: `flood ${n}`, where: 'x' });
+      const after = (await admin('GET', '/api/metrics')).data.browserErrors;
+      check('a flood of reports is cut off (at most 10 a minute from one visitor), and a huge one is refused', after.recent.filter((e) => /^flood/.test(e.message)).length <= 10 && (await anon('POST', '/api/public/client-error', { message: 'x'.repeat(9000) })).status === 413);
+      check('the reports hold no sign-in or private data (the fields are cut short, line breaks removed)', !after.recent.some((e) => /\n/.test(e.message)) && after.recent.every((e) => e.message.length <= 300));
+      await admin('POST', '/api/metrics/reset');
+      check('"start counting again" empties the figures', (await admin('GET', '/api/metrics')).data.browserErrors.count === 0);
+    }
 
     console.log('Admin, logs, backups');
     const logs = (await admin('GET', '/api/logs?limit=5000')).data;

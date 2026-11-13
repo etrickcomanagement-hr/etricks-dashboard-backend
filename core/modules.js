@@ -41,6 +41,9 @@ const CORE_MIGRATIONS = [
    DELETE FROM sessions;`,
   // 5: clients have their own portal: a session can belong to a client
   'ALTER TABLE sessions ADD COLUMN client_id INTEGER;',
+  // 6: which stored password hash belongs to which password "tag" (see core/auth.js tagOf): one lookup instead of ten slow checks at sign-in
+  `CREATE TABLE password_tags (hash TEXT PRIMARY KEY, tag TEXT NOT NULL, created_at TEXT NOT NULL);
+   CREATE INDEX idx_pwtag_tag ON password_tags(tag);`,
 ];
 
 const loaded = [];

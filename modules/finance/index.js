@@ -71,8 +71,8 @@ module.exports = {
       if (day > today()) throw bad('Date cannot be in the future');
       return {
         departmentId, teamId: teamFor(ctx, departmentId, existing ? (b.teamId !== undefined ? b.teamId : existing.teamId) : b.teamId), date: day, store: str(b.store, 'Store / account', { max: 100 }),
-        orders: int(b.orders ?? 0, 'Orders', { min: 0, max: 1e7 }), investment: num(b.investment ?? 0, 'Investment', { min: 0 }),
-        revenue: num(b.revenue ?? 0, 'Sales', { min: 0 }), expenses: num(b.expenses ?? 0, 'Expenses', { min: 0 }),
+        orders: (int(b.orders, 'Orders', { min: 0, max: 1e7 }) ?? 0), investment: (num(b.investment, 'Investment', { min: 0 }) ?? 0),
+        revenue: (num(b.revenue, 'Sales', { min: 0 }) ?? 0), expenses: (num(b.expenses, 'Expenses', { min: 0 }) ?? 0),
         note: str(b.note, 'Note', { max: 300 }), custom: JSON.stringify(cf.sanitize('finance', b.custom, existing ? parseJson(existing.custom, {}) : {})),
       };
     };

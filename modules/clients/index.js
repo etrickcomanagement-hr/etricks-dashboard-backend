@@ -277,14 +277,23 @@ module.exports = {
       const ids = rows.map((c) => c.id);
       const last = lastMessages(ids);
       const day = today();
-      const reports = ids.length ? db.all(`SELECT client_id, date, orders, investment, sales, currency FROM client_reports WHERE client_id IN (${ids.map(() => '?').join(',')})`, ...ids) : [];
+      // The database adds the numbers up (one row per client and currency): the list never loads the thousands of updates themselves.
+      const sumRows = ids.length ? db.all(
+        `SELECT client_id, currency, SUM(orders) AS orders, SUM(investment) AS investment, SUM(sales) AS sales,
+                SUM(CASE WHEN date=? THEN orders ELSE 0 END) AS t_orders, SUM(CASE WHEN date=? THEN investment ELSE 0 END) AS t_investment,
+                SUM(CASE WHEN date=? THEN sales ELSE 0 END) AS t_sales, SUM(CASE WHEN date=? THEN 1 ELSE 0 END) AS t_rows
+           FROM client_reports WHERE client_id IN (${ids.map(() => '?').join(',')}) GROUP BY client_id, currency`, day, day, day, day, ...ids) : [];
       const by = {};
-      for (const r of reports) (by[r.clientId] ||= []).push(r);
+      const byToday = {};
+      for (const r of sumRows) {
+        (by[r.clientId] ||= []).push({ currency: r.currency, orders: r.orders, investment: r.investment, sales: r.sales });
+        if (r.tRows) (byToday[r.clientId] ||= []).push({ currency: r.currency, orders: r.tOrders, investment: r.tInvestment, sales: r.tSales });
+      }
       return rows.map((c) => {
         return {
           ...shape(ctx, c),
-          today: sumsIn((by[c.id] || []).filter((r) => r.date === day), c.currency), total: sumsIn(by[c.id] || [], c.currency), // in the client's currency
-          todayBy: sumsBy((by[c.id] || []).filter((r) => r.date === day)), totalBy: sumsBy(by[c.id] || []), // as written, each currency on its own
+          today: sumsIn(byToday[c.id] || [], c.currency), total: sumsIn(by[c.id] || [], c.currency), // in the client's currency
+          todayBy: sumsBy(byToday[c.id] || []), totalBy: sumsBy(by[c.id] || []), // as written, each currency on its own
           inquiryNeedsReply: !!last[c.id]?.inquiry?.fromClient, alertNeedsReply: !!last[c.id]?.alert?.fromClient,
           lastInquiryAt: last[c.id]?.inquiry?.at ?? null, lastAlertAt: last[c.id]?.alert?.at ?? null,
         };
@@ -408,7 +417,7 @@ module.exports = {
       if (day > today()) throw bad('Date cannot be in the future');
       const e = {
         date: day, market: str(b.market, 'Market', { max: 100 }), store: str(b.store, 'Store / account', { max: 100 }),
-        orders: int(b.orders ?? 0, 'Orders', { min: 0, max: 1e7 }), investment: num(b.investment ?? 0, 'Investment', { min: 0, max: 1e9 }), sales: num(b.sales ?? 0, 'Sales', { min: 0, max: 1e9 }),
+        orders: (int(b.orders, 'Orders', { min: 0, max: 1e7 }) ?? 0), investment: (num(b.investment, 'Investment', { min: 0, max: 1e9 }) ?? 0), sales: (num(b.sales, 'Sales', { min: 0, max: 1e9 }) ?? 0),
         note: str(b.note, 'Update for the client', { max: 1000 }),
         currency: oneOf(b.currency === undefined || b.currency === null || b.currency === '' ? (fallbackCurrency || defaultCurrency()) : b.currency, 'Currency', CURRENCIES, { required: true }),
       };

@@ -7,6 +7,7 @@ const auth = require('./auth');
 const gate = require('./gate');
 const audit = require('./audit');
 const scope = require('./scope');
+const metrics = require('./metrics');
 const { HttpError, toCsv } = require('./util');
 
 const PUBLIC_DIR = path.join(config.root, 'public');
@@ -17,7 +18,7 @@ function add(method, pattern, opts, handler) {
   if (typeof opts === 'function') { handler = opts; opts = {}; }
   const keys = [];
   const regex = new RegExp('^' + pattern.replace(/:([a-zA-Z]+)/g, (_, k) => { keys.push(k); return '([^/]+)'; }) + '/?$');
-  routes.push({ method, regex, keys, handler, opts });
+  routes.push({ method, regex, keys, handler, opts, pattern });
 }
 
 const MIME = {
@@ -107,6 +108,7 @@ function buildCtx(req, url, params, user, body) {
 async function handleApi(req, res, url) {
   const route = routes.find((r) => r.method === req.method && r.regex.test(url.pathname));
   if (!route) throw new HttpError(404, 'Not found');
+  req.routeKey = `${route.method} ${route.pattern}`; // for the timing record
   const m = url.pathname.match(route.regex);
   const params = {};
   route.keys.forEach((k, i) => (params[k] = decodeURIComponent(m[i + 1])));
@@ -162,6 +164,11 @@ function serveStatic(req, res, url) {
 function createServer() {
   return http.createServer(async (req, res) => {
     securityHeaders(res);
+    // how long every API call took (see core/metrics.js): recorded when the answer has been sent
+    if (req.url.startsWith('/api/')) {
+      const t0 = process.hrtime.bigint();
+      res.on('finish', () => metrics.record(req.routeKey || `${req.method} (no such route)`, Number(process.hrtime.bigint() - t0) / 1e6, res.statusCode, `${req.method} ${req.url.split('?')[0]}`));
+    }
     try {
       const url = new URL(req.url, 'http://localhost');
       if (url.pathname.startsWith('/api/')) await handleApi(req, res, url);

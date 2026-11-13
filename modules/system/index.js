@@ -6,6 +6,7 @@ const modules = require('../../core/modules');
 const notify = require('../../core/notify');
 const currency = require('../../core/currency');
 const webpush = require('../../core/webpush');
+const metrics = require('../../core/metrics');
 const { HttpError, str, int, date, bad } = require('../../core/util');
 
 module.exports = {
@@ -27,7 +28,27 @@ module.exports = {
     const any = ['admin', 'hod', 'leader', 'member', 'client'];
     const lead = ['admin', 'hod']; // the activity log is for the admin and (for their department) the head
 
-    m.get('/api/health', () => ({ ok: true }));
+    // Answers only when the database answers too (the watchdog on the server restarts the service when this stops answering).
+    m.get('/api/health', () => { db.get('SELECT 1 AS ok'); return { ok: true, uptime: Math.round(process.uptime()) }; });
+    // The website tells the server when a screen failed (blank page, broken screen), so it is seen in the log and under Settings.
+    // No sign-in needed (it may be the sign-in page itself that failed); small, and limited per visitor.
+    const reported = new Map();
+    m.post('/api/public/client-error', { maxBody: 6000 }, (ctx) => {
+      const now = Date.now();
+      const rec = reported.get(ctx.ip) || { n: 0, since: now };
+      if (now - rec.since > 60e3) { rec.n = 0; rec.since = now; }
+      reported.set(ctx.ip, rec);
+      if (reported.size > 2000) reported.clear();
+      if (++rec.n > 10) return { ok: true }; // enough from one visitor
+      const clip = (v, n) => String(v ?? '').replace(/[\r\n]+/g, ' ').slice(0, n);
+      const e = { message: clip(ctx.body.message, 300), where: clip(ctx.body.where, 80), page: clip(ctx.body.page, 60), role: clip(ctx.body.role, 12), agent: clip(ctx.body.agent, 120) };
+      metrics.browserError(e);
+      console.warn(`[browser-error] ${e.role || 'visitor'} ${e.page} ${e.where}: ${e.message} | ${e.agent}`);
+      return { ok: true };
+    });
+    // How the server is doing since it started: slowest routes, how long it was stuck, memory. The admin only; no request content.
+    m.get('/api/metrics', { roles: ['admin'] }, () => metrics.snapshot());
+    m.post('/api/metrics/reset', { roles: ['admin'] }, () => { metrics.reset(); return { ok: true }; });
 
     m.get('/api/public/settings', () => ({ companyName: settings.get('companyName') }));
 

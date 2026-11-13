@@ -85,8 +85,17 @@ IP=$(curl -fsS -m 5 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/
 SITE="${IP//./-}.sslip.io"
 cat > /etc/caddy/Caddyfile <<EOF
 $SITE {
-	encode gzip
-	reverse_proxy 127.0.0.1:3000
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:3000 {
+		lb_try_duration 12s
+		lb_try_interval 250ms
+		transport http {
+			dial_timeout 3s
+			keepalive 60s
+			keepalive_idle_conns 64
+			response_header_timeout 90s
+		}
+	}
 }
 EOF
 
